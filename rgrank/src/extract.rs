@@ -1,11 +1,14 @@
+use std::cell::Cell;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use calamine::{Reader, Xlsx, open_workbook_from_rs};
 use flate2::read::MultiGzDecoder;
+use gag::Gag;
 use quick_xml::Reader as XmlReader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
@@ -14,6 +17,15 @@ use zip::ZipArchive;
 
 const MAX_ARCHIVE_DEPTH: usize = 4;
 const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024 * 1024;
+
+fn extractor_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+thread_local! {
+    static EXTRACTION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Copy)]
 enum XmlTextMode {
@@ -78,10 +90,12 @@ fn extract_archive_member_text(
         return Ok(Some(String::new()));
     }
     if let Some(kind) = detect_supported_kind(name) {
-        if depth >= MAX_ARCHIVE_DEPTH && matches!(
-            kind,
-            SupportedKind::Zip | SupportedKind::Tar | SupportedKind::TarGz
-        ) {
+        if depth >= MAX_ARCHIVE_DEPTH
+            && matches!(
+                kind,
+                SupportedKind::Zip | SupportedKind::Tar | SupportedKind::TarGz
+            )
+        {
             return Ok(None);
         }
         return Ok(Some(extract_supported_bytes(name, bytes, depth + 1)?));
@@ -162,7 +176,9 @@ fn extract_pptx_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
 }
 
 fn extract_pdf_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
-    Ok(clean_extracted_text(pdf_extract::extract_text_from_mem(bytes)?))
+    Ok(clean_extracted_text(pdf_extract::extract_text_from_mem(
+        bytes,
+    )?))
 }
 
 fn extract_zip_xml_text_from_reader<R, F>(
@@ -304,11 +320,7 @@ fn extract_plain_text(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let text = clean_extracted_text(String::from_utf8_lossy(bytes).into_owned());
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -325,13 +337,48 @@ fn guard_panic<T, F>(operation: &str, callback: F) -> Result<T, Box<dyn Error>>
 where
     F: FnOnce() -> Result<T, Box<dyn Error>>,
 {
-    panic::catch_unwind(AssertUnwindSafe(callback))
-        .map_err(|payload| {
-            Box::<dyn Error>::from(io::Error::other(format!(
-                "{operation} panicked: {}",
-                panic_payload_message(payload)
-            )))
-        })?
+    let is_outermost = EXTRACTION_DEPTH.with(|depth| {
+        let current = depth.get();
+        depth.set(current + 1);
+        current == 0
+    });
+    let _lock = if is_outermost {
+        Some(
+            extractor_lock()
+                .lock()
+                .map_err(|_| Box::<dyn Error>::from(io::Error::other("extractor lock poisoned")))?,
+        )
+    } else {
+        None
+    };
+    let _stdout_gag = if is_outermost && !cfg!(test) {
+        Gag::stdout().ok()
+    } else {
+        None
+    };
+    let _stderr_gag = if is_outermost && !cfg!(test) {
+        Gag::stderr().ok()
+    } else {
+        None
+    };
+    let previous_hook = if is_outermost {
+        let hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        Some(hook)
+    } else {
+        None
+    };
+    let result = panic::catch_unwind(AssertUnwindSafe(callback)).map_err(|payload| {
+        Box::<dyn Error>::from(io::Error::other(format!(
+            "{operation} panicked: {}",
+            panic_payload_message(payload)
+        )))
+    });
+    EXTRACTION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    if let Some(previous_hook) = previous_hook {
+        panic::set_hook(previous_hook);
+    }
+    result?
 }
 
 fn looks_like_text(bytes: &[u8]) -> bool {
@@ -426,10 +473,7 @@ fn extract_xml_text(xml: &str, mode: XmlTextMode) -> Result<String, Box<dyn Erro
     Ok(clean_extracted_text(output))
 }
 
-fn decode_xml_bytes(
-    reader: &XmlReader<&[u8]>,
-    bytes: &[u8],
-) -> Result<String, Box<dyn Error>> {
+fn decode_xml_bytes(reader: &XmlReader<&[u8]>, bytes: &[u8]) -> Result<String, Box<dyn Error>> {
     let decoded = reader.decoder().decode(bytes)?;
     Ok(unescape(decoded.as_ref())?.into_owned())
 }

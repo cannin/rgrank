@@ -2659,10 +2659,7 @@ mod tests {
     fn execute_search_supports_nested_archives() {
         let root = create_test_dir("nested-archive");
         let file = root.join("outer.zip");
-        let inner_tar = tar_bytes(&[(
-            "deep.txt".to_owned(),
-            b"nested tumor evidence\n".to_vec(),
-        )]);
+        let inner_tar = tar_bytes(&[("deep.txt".to_owned(), b"nested tumor evidence\n".to_vec())]);
         write_zip(&file, &[("inner.tar".to_owned(), inner_tar)]);
 
         let cli = Cli {

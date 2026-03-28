@@ -1,11 +1,12 @@
 [package]
 name = "rgrank"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 
 [dependencies]
 calamine = "0.24.0"
 flate2 = "1.1.9"
+gag = "1.0.0"
 grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
