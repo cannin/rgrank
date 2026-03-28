@@ -35,9 +35,8 @@ const MATCH_DENSITY_WEIGHT: f64 = 0.25;
 const SAME_LINE_TERM_BONUS: f64 = 0.45;
 const PROXIMITY_BONUS_WEIGHT: f64 = 1.6;
 const VERSION_TEXT: &str = concat!("rgrank ", env!("CARGO_PKG_VERSION"));
-const HELP_TEXT: &str = r#"rgrank: ripgrep-style search with file-level ranking
-
-Usage:
+const HELP_SUMMARY: &str = "ripgrep-style search with file-level ranking";
+const HELP_BODY: &str = r#"Usage:
   rgrank [options] <query> [path ...]
   rgrank --files [options] [path ...]
 
@@ -505,7 +504,7 @@ fn run() -> Result<RunOutcome, String> {
     match parse_args()? {
         ParseOutcome::Cli(cli) => execute_cli(&cli),
         ParseOutcome::Help => Ok(RunOutcome {
-            output: HELP_TEXT.to_owned(),
+            output: help_text(),
             exit_code: 0,
         }),
         ParseOutcome::Version => Ok(RunOutcome {
@@ -725,7 +724,7 @@ where
                 break;
             }
             _ if argument.starts_with('-') => {
-                return Err(format!("unknown flag: {argument}\n\n{HELP_TEXT}"));
+                return Err(format!("unknown flag: {argument}\n\n{}", help_text()));
             }
             _ => positionals.push(argument),
         }
@@ -740,7 +739,7 @@ where
         (None, roots)
     } else {
         if positionals.is_empty() {
-            return Err(format!("missing query\n\n{HELP_TEXT}"));
+            return Err(format!("missing query\n\n{}", help_text()));
         }
         let query = positionals.remove(0);
         if query.trim().is_empty() {
@@ -781,6 +780,10 @@ where
         no_ignore,
         follow_links,
     }))
+}
+
+fn help_text() -> String {
+    format!("{VERSION_TEXT}: {HELP_SUMMARY}\n\n{HELP_BODY}")
 }
 
 fn parse_usize_value(value: Option<String>, flag: &str) -> Result<usize, String> {
@@ -2311,6 +2314,12 @@ mod tests {
     fn parse_args_accepts_version_flag() {
         let outcome = parse_args_from(["--version".to_owned()]).expect("parse args");
         assert!(matches!(outcome, ParseOutcome::Version));
+    }
+
+    #[test]
+    fn help_text_includes_version_banner() {
+        let help = help_text();
+        assert!(help.starts_with(&format!("{VERSION_TEXT}: {HELP_SUMMARY}")));
     }
 
     #[test]
