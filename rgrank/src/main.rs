@@ -2112,10 +2112,13 @@ fn clone_snippet(snippet: &Snippet) -> Snippet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::Builder as TarBuilder;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
@@ -2573,6 +2576,107 @@ mod tests {
     }
 
     #[test]
+    fn execute_search_supports_zip_archives() {
+        let root = create_test_dir("zip-archive");
+        let file = root.join("bundle.zip");
+        write_zip(
+            &file,
+            &[(
+                "notes.txt".to_owned(),
+                b"archived cortisol finding\nsecondary line\n".to_vec(),
+            )],
+        );
+
+        let cli = Cli {
+            match_mode: MatchMode::FixedStrings,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
+            ..test_cli(&file, Some("cortisol"))
+        };
+        let report = execute_search(&cli).expect("report");
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(
+            report.results[0].path.file_name(),
+            Some(std::ffi::OsStr::new("bundle.zip"))
+        );
+        let snippet_text = report.results[0].snippets[0]
+            .lines
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(snippet_text.contains("Archive entry: notes.txt"));
+        assert!(snippet_text.contains("archived cortisol finding"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execute_search_supports_tar_and_tgz_archives() {
+        let root = create_test_dir("tar-archive");
+        let tar_file = root.join("bundle.tar");
+        let tgz_file = root.join("bundle.tgz");
+        let entries = vec![(
+            "sheet.txt".to_owned(),
+            b"aldosterone archive payload\n".to_vec(),
+        )];
+        write_tar(&tar_file, &entries);
+        write_tgz(&tgz_file, &entries);
+
+        let cli = Cli {
+            match_mode: MatchMode::FixedStrings,
+            top_k: 10,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: true,
+            ..test_cli(&root, Some("aldosterone"))
+        };
+        let report = execute_search(&cli).expect("report");
+        let file_names = report
+            .results
+            .iter()
+            .filter_map(|result| result.path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert!(file_names.contains(&"bundle.tar"));
+        assert!(file_names.contains(&"bundle.tgz"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execute_search_supports_nested_archives() {
+        let root = create_test_dir("nested-archive");
+        let file = root.join("outer.zip");
+        let inner_tar = tar_bytes(&[(
+            "deep.txt".to_owned(),
+            b"nested tumor evidence\n".to_vec(),
+        )]);
+        write_zip(&file, &[("inner.tar".to_owned(), inner_tar)]);
+
+        let cli = Cli {
+            match_mode: MatchMode::FixedStrings,
+            before_context: 2,
+            after_context: 1,
+            context_explicit: true,
+            ..test_cli(&file, Some("tumor"))
+        };
+        let report = execute_search(&cli).expect("report");
+        assert_eq!(report.results.len(), 1);
+        let snippet_text = report.results[0].snippets[0]
+            .lines
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(snippet_text.contains("Archive entry: inner.tar"));
+        assert!(snippet_text.contains("Archive entry: deep.txt"));
+        assert!(snippet_text.contains("nested tumor evidence"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn count_output_omits_path_for_single_file() {
         let root = create_test_dir("count-single");
         let file = root.join("sample.txt");
@@ -2721,5 +2825,42 @@ mod tests {
 
         zip.write_all(xml.as_bytes()).expect("write document.xml");
         zip.finish().expect("finish docx");
+    }
+
+    fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) {
+        let file = File::create(path).expect("create zip");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, contents) in entries {
+            zip.start_file(name, options).expect("start zip entry");
+            zip.write_all(contents).expect("write zip entry");
+        }
+        zip.finish().expect("finish zip");
+    }
+
+    fn write_tar(path: &Path, entries: &[(String, Vec<u8>)]) {
+        fs::write(path, tar_bytes(entries)).expect("write tar");
+    }
+
+    fn write_tgz(path: &Path, entries: &[(String, Vec<u8>)]) {
+        let tar_data = tar_bytes(entries);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).expect("write tgz");
+        let compressed = encoder.finish().expect("finish tgz");
+        fs::write(path, compressed).expect("write tgz file");
+    }
+
+    fn tar_bytes(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+        let mut builder = TarBuilder::new(Vec::new());
+        for (name, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, Cursor::new(contents.as_slice()))
+                .expect("append tar entry");
+        }
+        builder.into_inner().expect("finish tar")
     }
 }

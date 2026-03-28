@@ -1,13 +1,18 @@
 use std::error::Error;
-use std::fs::File;
-use std::io::Read;
+use std::fs;
+use std::io::{self, Cursor, Read, Seek};
 use std::path::Path;
 
-use calamine::{Reader, Xlsx, open_workbook};
+use calamine::{Reader, Xlsx, open_workbook_from_rs};
+use flate2::read::MultiGzDecoder;
 use quick_xml::Reader as XmlReader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
+use tar::Archive;
 use zip::ZipArchive;
+
+const MAX_ARCHIVE_DEPTH: usize = 4;
+const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum XmlTextMode {
@@ -15,61 +20,142 @@ enum XmlTextMode {
     Presentation,
 }
 
-pub fn extract_searchable_text(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
-    let Some(extension) = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-    else {
-        return Ok(None);
-    };
+#[derive(Clone, Copy)]
+enum SupportedKind {
+    Docx,
+    Pdf,
+    Pptx,
+    Xlsx,
+    Zip,
+    Tar,
+    TarGz,
+}
 
-    if is_office_lockfile(path) {
+pub fn extract_searchable_text(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    let display_name = path.to_string_lossy();
+    if is_office_lockfile_name(display_name.as_ref()) {
         return Ok(Some(String::new()));
     }
 
-    match extension.as_str() {
-        "docx" => Ok(Some(extract_docx(path)?)),
-        "pdf" => Ok(Some(clean_extracted_text(pdf_extract::extract_text(path)?))),
-        "pptx" => Ok(Some(extract_pptx(path)?)),
-        "xlsx" => Ok(Some(extract_xlsx(path)?)),
-        _ => Ok(None),
+    let Some(_) = detect_supported_kind(display_name.as_ref()) else {
+        return Ok(None);
+    };
+
+    let bytes = fs::read(path)?;
+    extract_supported_bytes(display_name.as_ref(), &bytes, 0).map(Some)
+}
+
+fn extract_supported_bytes(
+    name: &str,
+    bytes: &[u8],
+    depth: usize,
+) -> Result<String, Box<dyn Error>> {
+    let Some(kind) = detect_supported_kind(name) else {
+        return Ok(String::new());
+    };
+
+    match kind {
+        SupportedKind::Docx => extract_docx_from_bytes(bytes),
+        SupportedKind::Pdf => Ok(clean_extracted_text(pdf_extract::extract_text_from_mem(bytes)?)),
+        SupportedKind::Pptx => extract_pptx_from_bytes(bytes),
+        SupportedKind::Xlsx => extract_xlsx_from_bytes(bytes),
+        SupportedKind::Zip => extract_zip_archive(bytes, depth),
+        SupportedKind::Tar => extract_tar_archive(Cursor::new(bytes), depth),
+        SupportedKind::TarGz => {
+            let decoder = MultiGzDecoder::new(Cursor::new(bytes));
+            extract_tar_archive(decoder, depth)
+        }
     }
 }
 
-fn is_office_lockfile(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|value| value.to_str())
+fn extract_archive_member_text(
+    name: &str,
+    bytes: &[u8],
+    depth: usize,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if is_office_lockfile_name(name) {
+        return Ok(Some(String::new()));
+    }
+    if let Some(kind) = detect_supported_kind(name) {
+        if depth >= MAX_ARCHIVE_DEPTH && matches!(
+            kind,
+            SupportedKind::Zip | SupportedKind::Tar | SupportedKind::TarGz
+        ) {
+            return Ok(None);
+        }
+        return Ok(Some(extract_supported_bytes(name, bytes, depth + 1)?));
+    }
+    Ok(extract_plain_text(bytes))
+}
+
+fn detect_supported_kind(name: &str) -> Option<SupportedKind> {
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
+        return Some(SupportedKind::TarGz);
+    }
+    if lower_name.ends_with(".docx") {
+        return Some(SupportedKind::Docx);
+    }
+    if lower_name.ends_with(".pdf") {
+        return Some(SupportedKind::Pdf);
+    }
+    if lower_name.ends_with(".pptx") {
+        return Some(SupportedKind::Pptx);
+    }
+    if lower_name.ends_with(".xlsx") {
+        return Some(SupportedKind::Xlsx);
+    }
+    if lower_name.ends_with(".zip") {
+        return Some(SupportedKind::Zip);
+    }
+    if lower_name.ends_with(".tar") {
+        return Some(SupportedKind::Tar);
+    }
+    None
+}
+
+fn is_office_lockfile_name(name: &str) -> bool {
+    name.rsplit(['/', '\\'])
+        .next()
         .is_some_and(|value| value.starts_with("~$"))
 }
 
-fn extract_docx(path: &Path) -> Result<String, Box<dyn Error>> {
-    extract_zip_xml_text(path, |name| {
-        name == "word/document.xml"
-            || (name.starts_with("word/header") && name.ends_with(".xml"))
-            || (name.starts_with("word/footer") && name.ends_with(".xml"))
-            || (name.starts_with("word/footnotes") && name.ends_with(".xml"))
-            || (name.starts_with("word/endnotes") && name.ends_with(".xml"))
-            || (name.starts_with("word/comments") && name.ends_with(".xml"))
-    }, XmlTextMode::Word)
+fn extract_docx_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
+    extract_zip_xml_text_from_reader(
+        Cursor::new(bytes),
+        |name| {
+            name == "word/document.xml"
+                || (name.starts_with("word/header") && name.ends_with(".xml"))
+                || (name.starts_with("word/footer") && name.ends_with(".xml"))
+                || (name.starts_with("word/footnotes") && name.ends_with(".xml"))
+                || (name.starts_with("word/endnotes") && name.ends_with(".xml"))
+                || (name.starts_with("word/comments") && name.ends_with(".xml"))
+        },
+        XmlTextMode::Word,
+    )
 }
 
-fn extract_pptx(path: &Path) -> Result<String, Box<dyn Error>> {
-    extract_zip_xml_text(path, |name| {
-        (name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
-            || (name.starts_with("ppt/notesSlides/notesSlide") && name.ends_with(".xml"))
-    }, XmlTextMode::Presentation)
+fn extract_pptx_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
+    extract_zip_xml_text_from_reader(
+        Cursor::new(bytes),
+        |name| {
+            (name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
+                || (name.starts_with("ppt/notesSlides/notesSlide") && name.ends_with(".xml"))
+        },
+        XmlTextMode::Presentation,
+    )
 }
 
-fn extract_zip_xml_text<F>(
-    path: &Path,
+fn extract_zip_xml_text_from_reader<R, F>(
+    reader: R,
     predicate: F,
     mode: XmlTextMode,
 ) -> Result<String, Box<dyn Error>>
 where
+    R: Read + Seek,
     F: Fn(&str) -> bool,
 {
-    let mut archive = ZipArchive::new(File::open(path)?)?;
+    let mut archive = ZipArchive::new(reader)?;
     let mut parts = Vec::new();
 
     for index in 0..archive.len() {
@@ -89,8 +175,8 @@ where
     Ok(parts.join("\n"))
 }
 
-fn extract_xlsx(path: &Path) -> Result<String, Box<dyn Error>> {
-    let mut workbook: Xlsx<_> = open_workbook(path)?;
+fn extract_xlsx_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
+    let mut workbook: Xlsx<_> = open_workbook_from_rs(Cursor::new(bytes.to_vec()))?;
     let mut output = String::new();
 
     for sheet_name in workbook.sheet_names().to_owned() {
@@ -122,6 +208,115 @@ fn extract_xlsx(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(clean_extracted_text(output))
 }
 
+fn extract_zip_archive(bytes: &[u8], depth: usize) -> Result<String, Box<dyn Error>> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    let mut output = String::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if !entry.is_file() {
+            continue;
+        }
+        let entry_name = entry.name().to_owned();
+        let Some(member_bytes) = read_limited_bytes(&mut entry)? else {
+            continue;
+        };
+        let Ok(Some(text)) = extract_archive_member_text(&entry_name, &member_bytes, depth) else {
+            continue;
+        };
+        append_archive_section(&mut output, &entry_name, &text);
+    }
+
+    Ok(clean_extracted_text(output))
+}
+
+fn extract_tar_archive<R>(reader: R, depth: usize) -> Result<String, Box<dyn Error>>
+where
+    R: Read,
+{
+    let mut archive = Archive::new(reader);
+    let mut output = String::new();
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let entry_name = entry.path()?.to_string_lossy().into_owned();
+        let Some(member_bytes) = read_limited_bytes(&mut entry)? else {
+            continue;
+        };
+        let Ok(Some(text)) = extract_archive_member_text(&entry_name, &member_bytes, depth) else {
+            continue;
+        };
+        append_archive_section(&mut output, &entry_name, &text);
+    }
+
+    Ok(clean_extracted_text(output))
+}
+
+fn append_archive_section(output: &mut String, entry_name: &str, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !output.is_empty() {
+        output.push('\n');
+        output.push('\n');
+    }
+    output.push_str("Archive entry: ");
+    output.push_str(entry_name);
+    output.push('\n');
+    output.push_str(trimmed);
+}
+
+fn read_limited_bytes<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((MAX_ARCHIVE_ENTRY_BYTES + 1) as u64);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_ARCHIVE_ENTRY_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn extract_plain_text(bytes: &[u8]) -> Option<String> {
+    if !looks_like_text(bytes) {
+        return None;
+    }
+    let text = clean_extracted_text(String::from_utf8_lossy(bytes).into_owned());
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn looks_like_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let sample = &bytes[..bytes.len().min(4096)];
+    if std::str::from_utf8(sample).is_ok() {
+        return true;
+    }
+
+    let mut suspicious = 0usize;
+    for &byte in sample {
+        if byte == 0 {
+            return false;
+        }
+        if matches!(byte, b'\n' | b'\r' | b'\t' | 0x20..=0x7e) {
+            continue;
+        }
+        if byte < 0x09 || (0x0e..=0x1f).contains(&byte) || byte == 0x7f {
+            suspicious += 1;
+        }
+    }
+
+    suspicious * 20 <= sample.len()
+}
+
 fn extract_xml_text(xml: &str, mode: XmlTextMode) -> Result<String, Box<dyn Error>> {
     let mut reader = XmlReader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -134,12 +329,7 @@ fn extract_xml_text(xml: &str, mode: XmlTextMode) -> Result<String, Box<dyn Erro
             Event::Start(event) => {
                 let name = event.local_name().as_ref().to_vec();
                 match mode {
-                    XmlTextMode::Word => {
-                        if name.as_slice() == b"t" {
-                            in_text = true;
-                        }
-                    }
-                    XmlTextMode::Presentation => {
+                    XmlTextMode::Word | XmlTextMode::Presentation => {
                         if name.as_slice() == b"t" {
                             in_text = true;
                         }
@@ -166,14 +356,7 @@ fn extract_xml_text(xml: &str, mode: XmlTextMode) -> Result<String, Box<dyn Erro
             Event::End(event) => {
                 let name = event.local_name().as_ref().to_vec();
                 match mode {
-                    XmlTextMode::Word => {
-                        if name.as_slice() == b"t" {
-                            in_text = false;
-                        } else if name.as_slice() == b"p" {
-                            push_line_break(&mut output);
-                        }
-                    }
-                    XmlTextMode::Presentation => {
+                    XmlTextMode::Word | XmlTextMode::Presentation => {
                         if name.as_slice() == b"t" {
                             in_text = false;
                         } else if name.as_slice() == b"p" {
