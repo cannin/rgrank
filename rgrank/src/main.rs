@@ -2,12 +2,18 @@ use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
+};
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
+use ignore::types::TypesBuilder;
 
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_MAX_CANDIDATE_LINES: usize = 500;
@@ -34,20 +40,43 @@ Usage:
 Options:
       --files                 List matching file paths only
   -F, --fixed-strings         Treat the query as literal ranked terms instead of a regex
+  -i, --ignore-case           Force case insensitive matching
+  -s, --case-sensitive        Force case sensitive matching
+  -S, --smart-case            Use smart case matching
   -k, --top-k <n>             Number of ranked files to print (default: 5)
   -m, --max-candidate-lines <n>
                               Global cap on matched lines collected before ranking (default: 500)
-  -C, --context <n>           Context lines shown around each hit snippet (default: 2)
-  -s, --max-snippets <n>      Snippets shown per ranked file (default: 3)
+  -A, --after-context <n>     Lines shown after each hit
+  -B, --before-context <n>    Lines shown before each hit
+  -C, --context <n>           Lines shown before and after each hit
+      --max-snippets <n>      Snippets shown per ranked file (default: 3)
+  -g, --glob <pattern>        Include or exclude files using rg-style globs
+  -t, --type <type>           Only search files of the given type
+  -T, --type-not <type>       Exclude files of the given type
+  -n                          Show line numbers in standard output
+      --column                Show the first match column in standard output
+      --heading               Group matches under file headings
+      --no-heading            Disable grouped file headings
+      --json                  Emit JSON lines for matches
+      --color <when>          Colorize output: auto, always, never
+      --ranked                Use ranked output instead of rg-style output
+      --all                   In ranked mode, show all ranked files and snippets
+  -w, --word-regexp           Match whole words only
+  -x, --line-regexp           Match whole lines only
+  -l, --files-with-matches    Print only files that contain matches
+  -L, --files-without-match   Print only files that do not contain matches
+  -c, --count                 Print match counts per matching file
       --hidden                Include hidden files and directories
       --no-ignore             Disable .gitignore/.ignore filtering
-  -L, --follow-links          Follow symbolic links
-      --case-sensitive        Disable smart-case matching
+      --follow-links          Follow symbolic links
   -h, --help                  Show this help
 
 Behavior:
   - Uses ripgrep-style regex matching by default.
   - Use -F/--fixed-strings for literal term matching.
+  - Standard rg-style output is the default.
+  - Use --ranked for ranked file/snippet output.
+  - Standard output defaults to zero context; ranked snippets default to 2 lines before/after.
   - Respects .gitignore/.ignore by default.
   - Ranks files with BM25-like scoring, term coverage, filename boosts, and phrase/proximity bonuses.
 "#;
@@ -58,20 +87,57 @@ enum MatchMode {
     FixedStrings,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CaseMode {
+    Smart,
+    Sensitive,
+    Insensitive,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SearchOutputMode {
+    Standard,
+    Ranked,
+    FilesWithMatches,
+    FilesWithoutMatch,
+    Count,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Clone)]
 struct Cli {
     query: Option<String>,
     roots: Vec<PathBuf>,
     files_mode: bool,
     match_mode: MatchMode,
+    case_mode: CaseMode,
+    output_mode: SearchOutputMode,
+    show_all: bool,
     top_k: usize,
     max_candidate_lines: usize,
-    context_lines: usize,
+    before_context: usize,
+    after_context: usize,
+    context_explicit: bool,
     max_snippets: usize,
+    globs: Vec<String>,
+    type_names: Vec<String>,
+    type_not_names: Vec<String>,
+    line_numbers: bool,
+    show_column: bool,
+    heading: bool,
+    color_mode: ColorMode,
+    word_regexp: bool,
+    line_regexp: bool,
     hidden: bool,
     no_ignore: bool,
     follow_links: bool,
-    case_sensitive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +181,83 @@ struct SearchReport {
 }
 
 #[derive(Debug)]
+struct CountEntry {
+    path: PathBuf,
+    count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MatchEvent {
+    path: PathBuf,
+    line_number: usize,
+    column: Option<usize>,
+    text: String,
+    submatches: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+struct JsonLineEvent {
+    kind: JsonLineEventKind,
+    line_number: usize,
+    absolute_offset: u64,
+    text: String,
+    submatches: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum JsonLineEventKind {
+    Context,
+    Match,
+}
+
+#[derive(Debug)]
+struct JsonFileResult {
+    path: PathBuf,
+    matched_lines: usize,
+    matches: usize,
+    binary_offset: Option<u64>,
+    bytes_searched: u64,
+    elapsed: Duration,
+    events: Vec<JsonLineEvent>,
+}
+
+#[derive(Debug, Default)]
+struct JsonTotals {
+    searches: usize,
+    searches_with_match: usize,
+    matched_lines: usize,
+    matches: usize,
+    bytes_searched: u64,
+}
+
+#[derive(Debug)]
+struct RunOutcome {
+    output: String,
+    exit_code: i32,
+}
+
+#[derive(Debug)]
+struct JsonSearchResult {
+    output: String,
+    had_match: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OutputBlock {
+    path: PathBuf,
+    lines: Vec<OutputLine>,
+}
+
+#[derive(Debug, Clone)]
+struct OutputLine {
+    line_number: usize,
+    column: Option<usize>,
+    text: String,
+    submatches: Vec<(usize, usize)>,
+    is_match: bool,
+}
+
+#[derive(Debug)]
 struct RankedFile {
     path: PathBuf,
     score: f64,
@@ -139,6 +282,31 @@ struct CollectingSink {
     hit_limit: bool,
 }
 
+#[derive(Debug, Default)]
+struct CountingSink {
+    match_count: usize,
+    stop_after_first: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MatchEventSink {
+    path: PathBuf,
+    matcher: grep_regex::RegexMatcher,
+    capture_matches: bool,
+    events: Vec<MatchEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct JsonEventSink {
+    path: PathBuf,
+    matcher: grep_regex::RegexMatcher,
+    matched_lines: usize,
+    matches: usize,
+    events: Vec<JsonLineEvent>,
+    started_at: Instant,
+    finished: Option<SinkFinish>,
+}
+
 impl CollectingSink {
     fn new(query: Query, limit: usize) -> Self {
         Self {
@@ -146,6 +314,57 @@ impl CollectingSink {
             limit,
             lines: Vec::new(),
             hit_limit: false,
+        }
+    }
+}
+
+impl CountingSink {
+    fn new(stop_after_first: bool) -> Self {
+        Self {
+            match_count: 0,
+            stop_after_first,
+        }
+    }
+}
+
+impl MatchEventSink {
+    fn new(path: PathBuf, matcher: grep_regex::RegexMatcher, capture_matches: bool) -> Self {
+        Self {
+            path,
+            matcher,
+            capture_matches,
+            events: Vec::new(),
+        }
+    }
+}
+
+impl JsonEventSink {
+    fn new(path: PathBuf, matcher: grep_regex::RegexMatcher) -> Self {
+        Self {
+            path,
+            matcher,
+            matched_lines: 0,
+            matches: 0,
+            events: Vec::new(),
+            started_at: Instant::now(),
+            finished: None,
+        }
+    }
+
+    fn into_result(self) -> JsonFileResult {
+        let elapsed = self.started_at.elapsed();
+        let (binary_offset, bytes_searched) = match self.finished {
+            Some(finish) => (finish.binary_byte_offset(), finish.byte_count()),
+            None => (None, 0),
+        };
+        JsonFileResult {
+            path: self.path,
+            matched_lines: self.matched_lines,
+            matches: self.matches,
+            binary_offset,
+            bytes_searched,
+            elapsed,
+            events: self.events,
         }
     }
 }
@@ -177,28 +396,157 @@ impl Sink for CollectingSink {
     }
 }
 
+impl Sink for CountingSink {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        self.match_count += mat.lines().count();
+        Ok(!self.stop_after_first)
+    }
+}
+
+impl Sink for MatchEventSink {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let mut line_number = mat.line_number().unwrap_or(1);
+        for line in mat.lines() {
+            let line_bytes = trim_line_ending_bytes(line);
+            let submatches = if self.capture_matches {
+                find_submatches(&self.matcher, line_bytes)
+            } else {
+                Vec::new()
+            };
+            let column = submatches.first().map(|(start, _)| start + 1);
+            self.events.push(MatchEvent {
+                path: self.path.clone(),
+                line_number: line_number as usize,
+                column,
+                text: String::from_utf8_lossy(line_bytes).to_string(),
+                submatches,
+            });
+            line_number += 1;
+        }
+        Ok(true)
+    }
+}
+
+impl Sink for JsonEventSink {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let mut line_number = mat.line_number().unwrap_or(1);
+        let mut absolute_offset = mat.absolute_byte_offset();
+        for line in mat.lines() {
+            let submatches = find_submatches(&self.matcher, line);
+            self.matched_lines += 1;
+            self.matches += submatches.len().max(1);
+            self.events.push(JsonLineEvent {
+                kind: JsonLineEventKind::Match,
+                line_number: line_number as usize,
+                absolute_offset,
+                text: String::from_utf8_lossy(line).to_string(),
+                submatches,
+            });
+            line_number += 1;
+            absolute_offset += line.len() as u64;
+        }
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        context: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.events.push(JsonLineEvent {
+            kind: JsonLineEventKind::Context,
+            line_number: context.line_number().unwrap_or(1) as usize,
+            absolute_offset: context.absolute_byte_offset(),
+            text: String::from_utf8_lossy(context.bytes()).to_string(),
+            submatches: Vec::new(),
+        });
+        Ok(true)
+    }
+
+    fn finish(&mut self, _searcher: &Searcher, finish: &SinkFinish) -> Result<(), Self::Error> {
+        self.finished = Some(finish.clone());
+        Ok(())
+    }
+}
+
 fn main() {
     match run() {
-        Ok(output) => {
-            if !output.is_empty() {
-                println!("{output}");
+        Ok(outcome) => {
+            if !outcome.output.is_empty() {
+                println!("{}", outcome.output);
             }
+            std::process::exit(outcome.exit_code);
         }
         Err(message) => {
             eprintln!("{message}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }
 
-fn run() -> Result<String, String> {
+fn run() -> Result<RunOutcome, String> {
     let cli = parse_args()?;
+    execute_cli(&cli)
+}
+
+fn execute_cli(cli: &Cli) -> Result<RunOutcome, String> {
     if cli.files_mode {
         let files = list_files(&cli).map_err(|error| error.to_string())?;
-        return Ok(render_file_list(&files));
+        return Ok(RunOutcome {
+            output: render_file_list(&files),
+            exit_code: 0,
+        });
     }
-    let report = execute_search(&cli).map_err(|error| error.to_string())?;
-    Ok(render_report(&report))
+    match cli.output_mode {
+        SearchOutputMode::Standard => {
+            let events = execute_standard_search(&cli).map_err(|error| error.to_string())?;
+            Ok(RunOutcome {
+                output: render_standard_output(&events, &cli),
+                exit_code: if events.is_empty() { 1 } else { 0 },
+            })
+        }
+        SearchOutputMode::Ranked => {
+            let report = execute_search(&cli).map_err(|error| error.to_string())?;
+            Ok(RunOutcome {
+                output: render_report(&report),
+                exit_code: if report.candidate_lines == 0 { 1 } else { 0 },
+            })
+        }
+        SearchOutputMode::FilesWithMatches => {
+            let files = execute_files_with_matches(&cli).map_err(|error| error.to_string())?;
+            Ok(RunOutcome {
+                output: render_file_list(&files),
+                exit_code: if files.is_empty() { 1 } else { 0 },
+            })
+        }
+        SearchOutputMode::FilesWithoutMatch => {
+            let files = execute_files_without_match(&cli).map_err(|error| error.to_string())?;
+            Ok(RunOutcome {
+                output: render_file_list(&files),
+                exit_code: if files.is_empty() { 1 } else { 0 },
+            })
+        }
+        SearchOutputMode::Count => {
+            let counts = execute_count(&cli).map_err(|error| error.to_string())?;
+            Ok(RunOutcome {
+                output: render_count_list(&counts, &cli),
+                exit_code: if counts.is_empty() { 1 } else { 0 },
+            })
+        }
+        SearchOutputMode::Json => {
+            let result = execute_json_search(&cli).map_err(|error| error.to_string())?;
+            Ok(RunOutcome {
+                output: result.output,
+                exit_code: if result.had_match { 0 } else { 1 },
+            })
+        }
+    }
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -211,14 +559,27 @@ where
 {
     let mut top_k = DEFAULT_TOP_K;
     let mut max_candidate_lines = DEFAULT_MAX_CANDIDATE_LINES;
-    let mut context_lines = DEFAULT_CONTEXT_LINES;
+    let mut before_context = 0usize;
+    let mut after_context = 0usize;
+    let mut context_explicit = false;
     let mut max_snippets = DEFAULT_MAX_SNIPPETS;
     let mut hidden = false;
     let mut no_ignore = false;
     let mut follow_links = false;
-    let mut case_sensitive = false;
     let mut files_mode = false;
     let mut match_mode = MatchMode::Regex;
+    let mut case_mode = CaseMode::Smart;
+    let mut output_mode = SearchOutputMode::Standard;
+    let mut show_all = false;
+    let mut globs = Vec::new();
+    let mut type_names = Vec::new();
+    let mut type_not_names = Vec::new();
+    let mut line_numbers = false;
+    let mut show_column = false;
+    let mut heading = false;
+    let mut color_mode = ColorMode::Auto;
+    let mut word_regexp = false;
+    let mut line_regexp = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut args = args.into_iter();
 
@@ -227,21 +588,58 @@ where
             "-h" | "--help" => print_help(),
             "--files" => files_mode = true,
             "-F" | "--fixed-strings" => match_mode = MatchMode::FixedStrings,
+            "-i" | "--ignore-case" => case_mode = CaseMode::Insensitive,
+            "-s" | "--case-sensitive" => case_mode = CaseMode::Sensitive,
+            "-S" | "--smart-case" => case_mode = CaseMode::Smart,
+            "-n" => line_numbers = true,
+            "--column" => show_column = true,
+            "--heading" => heading = true,
+            "--no-heading" => heading = false,
+            "--json" => output_mode = SearchOutputMode::Json,
+            "--ranked" => output_mode = SearchOutputMode::Ranked,
+            "--all" => show_all = true,
+            "--color" => {
+                color_mode = parse_color_mode(&parse_string_value(args.next(), &argument)?)?;
+            }
+            "-w" | "--word-regexp" => word_regexp = true,
+            "-x" | "--line-regexp" => line_regexp = true,
+            "-l" | "--files-with-matches" => output_mode = SearchOutputMode::FilesWithMatches,
+            "-L" | "--files-without-match" => output_mode = SearchOutputMode::FilesWithoutMatch,
+            "-c" | "--count" => output_mode = SearchOutputMode::Count,
             "--hidden" => hidden = true,
             "--no-ignore" => no_ignore = true,
-            "-L" | "--follow-links" => follow_links = true,
-            "--case-sensitive" => case_sensitive = true,
+            "--follow-links" => follow_links = true,
             "-k" | "--top-k" => {
                 top_k = parse_usize_value(args.next(), &argument)?;
             }
             "-m" | "--max-candidate-lines" => {
                 max_candidate_lines = parse_usize_value(args.next(), &argument)?;
             }
-            "-C" | "--context" => {
-                context_lines = parse_usize_value(args.next(), &argument)?;
+            "-A" | "--after-context" => {
+                context_explicit = true;
+                after_context = parse_usize_value(args.next(), &argument)?;
             }
-            "-s" | "--max-snippets" => {
+            "-B" | "--before-context" => {
+                context_explicit = true;
+                before_context = parse_usize_value(args.next(), &argument)?;
+            }
+            "-C" | "--context" => {
+                context_explicit = true;
+                let context = parse_usize_value(args.next(), &argument)?;
+                before_context = context;
+                after_context = context;
+            }
+            "--max-snippets" => {
                 max_snippets = parse_usize_value(args.next(), &argument)?;
+            }
+            "-g" | "--glob" => {
+                globs.push(parse_string_value(args.next(), &argument)?);
+            }
+            "-t" | "--type" => {
+                type_names.push(parse_string_value(args.next(), &argument)?);
+            }
+            "-T" | "--type-not" => {
+                type_not_names.push(parse_string_value(args.next(), &argument)?);
             }
             _ if argument.starts_with("--top-k=") => {
                 top_k = parse_usize_inline(&argument, "--top-k=")?;
@@ -249,11 +647,57 @@ where
             _ if argument.starts_with("--max-candidate-lines=") => {
                 max_candidate_lines = parse_usize_inline(&argument, "--max-candidate-lines=")?;
             }
+            _ if argument.starts_with("--after-context=") => {
+                context_explicit = true;
+                after_context = parse_usize_inline(&argument, "--after-context=")?;
+            }
+            _ if argument.starts_with("--before-context=") => {
+                context_explicit = true;
+                before_context = parse_usize_inline(&argument, "--before-context=")?;
+            }
             _ if argument.starts_with("--context=") => {
-                context_lines = parse_usize_inline(&argument, "--context=")?;
+                context_explicit = true;
+                let context = parse_usize_inline(&argument, "--context=")?;
+                before_context = context;
+                after_context = context;
             }
             _ if argument.starts_with("--max-snippets=") => {
                 max_snippets = parse_usize_inline(&argument, "--max-snippets=")?;
+            }
+            _ if argument.starts_with("--glob=") => {
+                globs.push(parse_string_inline(&argument, "--glob=")?);
+            }
+            _ if argument.starts_with("--type=") => {
+                type_names.push(parse_string_inline(&argument, "--type=")?);
+            }
+            _ if argument.starts_with("--type-not=") => {
+                type_not_names.push(parse_string_inline(&argument, "--type-not=")?);
+            }
+            _ if argument.starts_with("--color=") => {
+                color_mode = parse_color_mode(&parse_string_inline(&argument, "--color=")?)?;
+            }
+            _ if argument.starts_with("-A") && argument.len() > 2 => {
+                context_explicit = true;
+                after_context = parse_short_usize_inline(&argument, "-A")?;
+            }
+            _ if argument.starts_with("-B") && argument.len() > 2 => {
+                context_explicit = true;
+                before_context = parse_short_usize_inline(&argument, "-B")?;
+            }
+            _ if argument.starts_with("-C") && argument.len() > 2 => {
+                context_explicit = true;
+                let context = parse_short_usize_inline(&argument, "-C")?;
+                before_context = context;
+                after_context = context;
+            }
+            _ if argument.starts_with("-g") && argument.len() > 2 => {
+                globs.push(parse_short_string_inline(&argument, "-g")?);
+            }
+            _ if argument.starts_with("-t") && argument.len() > 2 => {
+                type_names.push(parse_short_string_inline(&argument, "-t")?);
+            }
+            _ if argument.starts_with("-T") && argument.len() > 2 => {
+                type_not_names.push(parse_short_string_inline(&argument, "-T")?);
             }
             "--" => {
                 positionals.extend(args);
@@ -294,14 +738,27 @@ where
         roots,
         files_mode,
         match_mode,
+        case_mode,
+        output_mode,
+        show_all,
         top_k,
         max_candidate_lines,
-        context_lines,
+        before_context,
+        after_context,
+        context_explicit,
         max_snippets,
+        globs,
+        type_names,
+        type_not_names,
+        line_numbers,
+        show_column,
+        heading,
+        color_mode,
+        word_regexp,
+        line_regexp,
         hidden,
         no_ignore,
         follow_links,
-        case_sensitive,
     })
 }
 
@@ -318,6 +775,10 @@ fn parse_usize_value(value: Option<String>, flag: &str) -> Result<usize, String>
         .map_err(|_| format!("invalid numeric value for {flag}: {raw}"))
 }
 
+fn parse_string_value(value: Option<String>, flag: &str) -> Result<String, String> {
+    value.ok_or_else(|| format!("missing value for {flag}"))
+}
+
 fn parse_usize_inline(argument: &str, prefix: &str) -> Result<usize, String> {
     let value = argument
         .strip_prefix(prefix)
@@ -325,6 +786,38 @@ fn parse_usize_inline(argument: &str, prefix: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .map_err(|_| format!("invalid numeric value for {prefix}: {value}"))
+}
+
+fn parse_string_inline(argument: &str, prefix: &str) -> Result<String, String> {
+    argument
+        .strip_prefix(prefix)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("invalid flag syntax: {argument}"))
+}
+
+fn parse_short_usize_inline(argument: &str, prefix: &str) -> Result<usize, String> {
+    let value = argument
+        .strip_prefix(prefix)
+        .ok_or_else(|| format!("invalid flag syntax: {argument}"))?;
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid numeric value for {prefix}: {value}"))
+}
+
+fn parse_short_string_inline(argument: &str, prefix: &str) -> Result<String, String> {
+    argument
+        .strip_prefix(prefix)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("invalid flag syntax: {argument}"))
+}
+
+fn parse_color_mode(value: &str) -> Result<ColorMode, String> {
+    match value {
+        "auto" => Ok(ColorMode::Auto),
+        "always" => Ok(ColorMode::Always),
+        "never" => Ok(ColorMode::Never),
+        _ => Err(format!("invalid value for --color: {value}")),
+    }
 }
 
 fn build_walk_builder(cli: &Cli) -> Result<WalkBuilder, Box<dyn Error>> {
@@ -349,6 +842,24 @@ fn build_walk_builder(cli: &Cli) -> Result<WalkBuilder, Box<dyn Error>> {
         walker_builder.git_ignore(false);
         walker_builder.git_global(false);
         walker_builder.git_exclude(false);
+    }
+    if !cli.globs.is_empty() {
+        let mut override_builder = OverrideBuilder::new(".");
+        for glob in &cli.globs {
+            override_builder.add(glob)?;
+        }
+        walker_builder.overrides(override_builder.build()?);
+    }
+    if !cli.type_names.is_empty() || !cli.type_not_names.is_empty() {
+        let mut types_builder = TypesBuilder::new();
+        types_builder.add_defaults();
+        for type_name in &cli.type_names {
+            types_builder.select(type_name);
+        }
+        for type_name in &cli.type_not_names {
+            types_builder.negate(type_name);
+        }
+        walker_builder.types(types_builder.build()?);
     }
     walker_builder.require_git(false);
     Ok(walker_builder)
@@ -376,22 +887,8 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
         .as_deref()
         .ok_or_else(|| "query is required unless --files is set".to_owned())?;
     let query = Query::from_raw(query_text)?;
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    if cli.case_sensitive {
-        matcher_builder.case_insensitive(false);
-        matcher_builder.case_smart(false);
-    } else {
-        matcher_builder.case_smart(true);
-    }
-    let matcher = match cli.match_mode {
-        MatchMode::Regex => matcher_builder.build(query_text)?,
-        MatchMode::FixedStrings => matcher_builder.build_literals(&query.terms)?,
-    };
-
-    let mut searcher_builder = SearcherBuilder::new();
-    searcher_builder.line_number(true);
-    searcher_builder.binary_detection(BinaryDetection::quit(0));
-    let mut searcher = searcher_builder.build();
+    let matcher = build_matcher(cli, query_text, &query)?;
+    let mut searcher = build_searcher(true);
 
     let walker_builder = build_walk_builder(cli)?;
 
@@ -434,12 +931,22 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
     }
 
     let mut ranked = rank_candidates(&query, candidates);
-    ranked.truncate(cli.top_k);
+    if !cli.show_all {
+        ranked.truncate(cli.top_k);
+    }
+    let max_snippets = if cli.show_all {
+        usize::MAX
+    } else {
+        cli.max_snippets
+    };
+    let before_context = ranked_before_context(cli);
+    let after_context = ranked_after_context(cli);
     for result in &mut ranked {
         result.snippets = build_snippets(
             &result.path,
-            cli.context_lines,
-            cli.max_snippets,
+            before_context,
+            after_context,
+            max_snippets,
             &result.snippets,
         );
     }
@@ -451,6 +958,234 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
         candidate_lines,
         truncated,
         results: ranked,
+    })
+}
+
+fn execute_files_with_matches(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let query_text = cli
+        .query
+        .as_deref()
+        .ok_or_else(|| "query is required unless --files is set".to_owned())?;
+    let query = Query::from_raw(query_text)?;
+    let matcher = build_matcher(cli, query_text, &query)?;
+    let walker_builder = build_walk_builder(cli)?;
+    let mut searcher = build_searcher(false);
+    let mut files = Vec::new();
+
+    for entry in walker_builder.build() {
+        let Ok(dir_entry) = entry else {
+            continue;
+        };
+        if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
+            continue;
+        }
+        let count = search_file_count(&mut searcher, &matcher, dir_entry.path(), true)?;
+        if count > 0 {
+            files.push(dir_entry.path().to_path_buf());
+        }
+    }
+
+    Ok(files)
+}
+
+fn execute_files_without_match(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let query_text = cli
+        .query
+        .as_deref()
+        .ok_or_else(|| "query is required unless --files is set".to_owned())?;
+    let query = Query::from_raw(query_text)?;
+    let matcher = build_matcher(cli, query_text, &query)?;
+    let walker_builder = build_walk_builder(cli)?;
+    let mut searcher = build_searcher(false);
+    let mut files = Vec::new();
+
+    for entry in walker_builder.build() {
+        let Ok(dir_entry) = entry else {
+            continue;
+        };
+        if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
+            continue;
+        }
+        let count = search_file_count(&mut searcher, &matcher, dir_entry.path(), true)?;
+        if count == 0 {
+            files.push(dir_entry.path().to_path_buf());
+        }
+    }
+
+    Ok(files)
+}
+
+fn execute_count(cli: &Cli) -> Result<Vec<CountEntry>, Box<dyn Error>> {
+    let query_text = cli
+        .query
+        .as_deref()
+        .ok_or_else(|| "query is required unless --files is set".to_owned())?;
+    let query = Query::from_raw(query_text)?;
+    let matcher = build_matcher(cli, query_text, &query)?;
+    let walker_builder = build_walk_builder(cli)?;
+    let mut searcher = build_searcher(false);
+    let mut counts = Vec::new();
+
+    for entry in walker_builder.build() {
+        let Ok(dir_entry) = entry else {
+            continue;
+        };
+        if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
+            continue;
+        }
+        let count = search_file_count(&mut searcher, &matcher, dir_entry.path(), false)?;
+        if count > 0 {
+            counts.push(CountEntry {
+                path: dir_entry.path().to_path_buf(),
+                count,
+            });
+        }
+    }
+
+    Ok(counts)
+}
+
+fn build_matcher(
+    cli: &Cli,
+    query_text: &str,
+    query: &Query,
+) -> Result<grep_regex::RegexMatcher, Box<dyn Error>> {
+    let mut matcher_builder = RegexMatcherBuilder::new();
+    match cli.case_mode {
+        CaseMode::Smart => {
+            matcher_builder.case_insensitive(false);
+            matcher_builder.case_smart(true);
+        }
+        CaseMode::Sensitive => {
+            matcher_builder.case_insensitive(false);
+            matcher_builder.case_smart(false);
+        }
+        CaseMode::Insensitive => {
+            matcher_builder.case_insensitive(true);
+            matcher_builder.case_smart(false);
+        }
+    }
+    matcher_builder.word(cli.word_regexp);
+    matcher_builder.whole_line(cli.line_regexp);
+    let matcher = match cli.match_mode {
+        MatchMode::Regex => matcher_builder.build(query_text)?,
+        MatchMode::FixedStrings => matcher_builder.build_literals(&query.terms)?,
+    };
+    Ok(matcher)
+}
+
+fn build_searcher(line_numbers: bool) -> Searcher {
+    let mut searcher_builder = SearcherBuilder::new();
+    searcher_builder.line_number(line_numbers);
+    searcher_builder.binary_detection(BinaryDetection::quit(0));
+    searcher_builder.build()
+}
+
+fn build_searcher_with_context(
+    line_numbers: bool,
+    before_context: usize,
+    after_context: usize,
+) -> Searcher {
+    let mut searcher_builder = SearcherBuilder::new();
+    searcher_builder.line_number(line_numbers);
+    searcher_builder.before_context(before_context);
+    searcher_builder.after_context(after_context);
+    searcher_builder.binary_detection(BinaryDetection::quit(0));
+    searcher_builder.build()
+}
+
+fn search_file_count(
+    searcher: &mut Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    path: &Path,
+    stop_after_first: bool,
+) -> Result<usize, Box<dyn Error>> {
+    let mut sink = CountingSink::new(stop_after_first);
+    searcher.search_path(matcher, path, &mut sink)?;
+    Ok(sink.match_count)
+}
+
+fn execute_standard_search(cli: &Cli) -> Result<Vec<MatchEvent>, Box<dyn Error>> {
+    let query_text = cli
+        .query
+        .as_deref()
+        .ok_or_else(|| "query is required unless --files is set".to_owned())?;
+    let query = Query::from_raw(query_text)?;
+    let matcher = build_matcher(cli, query_text, &query)?;
+    let walker_builder = build_walk_builder(cli)?;
+    let mut searcher = build_searcher(true);
+    let mut events = Vec::new();
+    let capture_matches =
+        cli.show_column || color_enabled(cli) || cli.output_mode == SearchOutputMode::Json;
+
+    for entry in walker_builder.build() {
+        let Ok(dir_entry) = entry else {
+            continue;
+        };
+        if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
+            continue;
+        }
+        let mut sink = MatchEventSink::new(
+            dir_entry.path().to_path_buf(),
+            matcher.clone(),
+            capture_matches,
+        );
+        if let Err(error) = searcher.search_path(&matcher, dir_entry.path(), &mut sink) {
+            eprintln!(
+                "warning: failed to search {}: {error}",
+                dir_entry.path().display()
+            );
+            continue;
+        }
+        events.extend(sink.events);
+    }
+
+    Ok(events)
+}
+
+fn execute_json_search(cli: &Cli) -> Result<JsonSearchResult, Box<dyn Error>> {
+    let query_text = cli
+        .query
+        .as_deref()
+        .ok_or_else(|| "query is required unless --files is set".to_owned())?;
+    let query = Query::from_raw(query_text)?;
+    let matcher = build_matcher(cli, query_text, &query)?;
+    let walker_builder = build_walk_builder(cli)?;
+    let mut searcher = build_searcher_with_context(true, cli.before_context, cli.after_context);
+    let started_at = Instant::now();
+    let mut totals = JsonTotals::default();
+    let mut file_results = Vec::new();
+
+    for entry in walker_builder.build() {
+        let Ok(dir_entry) = entry else {
+            continue;
+        };
+        if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
+            continue;
+        }
+        totals.searches += 1;
+        let mut sink = JsonEventSink::new(dir_entry.path().to_path_buf(), matcher.clone());
+        if let Err(error) = searcher.search_path(&matcher, dir_entry.path(), &mut sink) {
+            eprintln!(
+                "warning: failed to search {}: {error}",
+                dir_entry.path().display()
+            );
+            continue;
+        }
+        let result = sink.into_result();
+        totals.bytes_searched += result.bytes_searched;
+        totals.matched_lines += result.matched_lines;
+        totals.matches += result.matches;
+        if result.matched_lines > 0 {
+            totals.searches_with_match += 1;
+            file_results.push(result);
+        }
+    }
+
+    let had_match = totals.searches_with_match > 0;
+    Ok(JsonSearchResult {
+        output: render_json_output(&file_results, totals, started_at.elapsed()),
+        had_match,
     })
 }
 
@@ -539,7 +1274,8 @@ fn score_candidate(query: &Query, stats: &CorpusStats, candidate: FileCandidate)
 
 fn build_snippets(
     path: &Path,
-    context_lines: usize,
+    before_context: usize,
+    after_context: usize,
     max_snippets: usize,
     placeholder_snippets: &[Snippet],
 ) -> Vec<Snippet> {
@@ -560,8 +1296,8 @@ fn build_snippets(
 
     let mut merged = Vec::<Snippet>::new();
     for snippet in placeholder_snippets {
-        let start_line = snippet.start_line.saturating_sub(context_lines).max(1);
-        let end_line = (snippet.end_line + context_lines).min(file_lines.len());
+        let start_line = snippet.start_line.saturating_sub(before_context).max(1);
+        let end_line = (snippet.end_line + after_context).min(file_lines.len());
         if let Some(previous) = merged.last_mut() {
             if start_line <= previous.end_line + 1 {
                 previous.end_line = previous.end_line.max(end_line);
@@ -649,6 +1385,428 @@ fn render_file_list(files: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_count_list(counts: &[CountEntry], cli: &Cli) -> String {
+    let show_path = show_path_in_standard_output(cli);
+    counts
+        .iter()
+        .map(|entry| {
+            if show_path {
+                format!("{}:{}", entry.path.display(), entry.count)
+            } else {
+                entry.count.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_standard_output(events: &[MatchEvent], cli: &Cli) -> String {
+    let blocks = build_output_blocks(events, cli);
+    let mut lines = Vec::new();
+    let use_color = color_enabled(cli);
+    let show_path = show_path_in_standard_output(cli);
+    let show_heading = cli.heading && show_path;
+    let has_context = cli.before_context > 0 || cli.after_context > 0;
+    let mut last_path: Option<&Path> = None;
+
+    for (index, block) in blocks.iter().enumerate() {
+        if show_heading && last_path != Some(block.path.as_path()) {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push(block.path.display().to_string());
+            last_path = Some(block.path.as_path());
+        } else if has_context && index > 0 {
+            lines.push("--".to_owned());
+        }
+
+        for line in &block.lines {
+            let rendered_text = if use_color && line.is_match {
+                highlight_text(&line.text, &line.submatches)
+            } else {
+                line.text.clone()
+            };
+            lines.push(render_standard_line(
+                &block.path,
+                line,
+                &rendered_text,
+                cli,
+                show_heading,
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn render_json_output(
+    file_results: &[JsonFileResult],
+    totals: JsonTotals,
+    elapsed_total: Duration,
+) -> String {
+    let mut lines = Vec::new();
+    let mut total_bytes_printed = 0usize;
+
+    for result in file_results {
+        let file_lines = render_json_file(result);
+        total_bytes_printed += rendered_bytes(&file_lines);
+        lines.extend(file_lines);
+    }
+
+    lines.push(render_json_summary(
+        &totals,
+        elapsed_total,
+        total_bytes_printed,
+    ));
+    lines.join("\n")
+}
+
+fn render_json_file(result: &JsonFileResult) -> Vec<String> {
+    let path = json_escape(&result.path.display().to_string());
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{{\"type\":\"begin\",\"data\":{{\"path\":{{\"text\":\"{}\"}}}}}}",
+        path
+    ));
+    for event in &result.events {
+        lines.push(render_json_line_event(&path, event));
+    }
+    let elapsed = json_duration(result.elapsed);
+    let mut bytes_printed = rendered_bytes(&lines);
+    let end_line = render_json_end(result, &path, &elapsed, bytes_printed);
+    bytes_printed += end_line.len() + 1;
+    let end_line = render_json_end(result, &path, &elapsed, bytes_printed);
+    lines.push(end_line);
+    lines
+}
+
+fn render_json_line_event(path: &str, event: &JsonLineEvent) -> String {
+    let event_type = match event.kind {
+        JsonLineEventKind::Context => "context",
+        JsonLineEventKind::Match => "match",
+    };
+    let submatches = render_json_submatches(&event.text, &event.submatches);
+    format!(
+        "{{\"type\":\"{}\",\"data\":{{\"path\":{{\"text\":\"{}\"}},\"lines\":{{\"text\":\"{}\"}},\"line_number\":{},\"absolute_offset\":{},\"submatches\":[{}]}}}}",
+        event_type,
+        path,
+        json_escape(&event.text),
+        event.line_number,
+        event.absolute_offset,
+        submatches
+    )
+}
+
+fn render_json_end(
+    result: &JsonFileResult,
+    path: &str,
+    elapsed: &JsonDuration,
+    bytes_printed: usize,
+) -> String {
+    format!(
+        "{{\"type\":\"end\",\"data\":{{\"path\":{{\"text\":\"{}\"}},\"binary_offset\":{},\"stats\":{{\"elapsed\":{},\"searches\":1,\"searches_with_match\":1,\"bytes_searched\":{},\"bytes_printed\":{},\"matched_lines\":{},\"matches\":{}}}}}}}",
+        path,
+        json_optional_u64(result.binary_offset),
+        elapsed.render(),
+        result.bytes_searched,
+        bytes_printed,
+        result.matched_lines,
+        result.matches
+    )
+}
+
+fn render_json_summary(
+    totals: &JsonTotals,
+    elapsed_total: Duration,
+    bytes_printed: usize,
+) -> String {
+    let elapsed = json_duration(elapsed_total);
+    format!(
+        "{{\"data\":{{\"elapsed_total\":{},\"stats\":{{\"bytes_printed\":{},\"bytes_searched\":{},\"elapsed\":{},\"matched_lines\":{},\"matches\":{},\"searches\":{},\"searches_with_match\":{}}}}},\"type\":\"summary\"}}",
+        elapsed.render(),
+        bytes_printed,
+        totals.bytes_searched,
+        elapsed.render(),
+        totals.matched_lines,
+        totals.matches,
+        totals.searches,
+        totals.searches_with_match
+    )
+}
+
+fn render_json_submatches(text: &str, submatches: &[(usize, usize)]) -> String {
+    submatches
+        .iter()
+        .map(|(start, end)| {
+            format!(
+                "{{\"match\":{{\"text\":\"{}\"}},\"start\":{},\"end\":{}}}",
+                json_escape(&text[*start..*end]),
+                start,
+                end
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn rendered_bytes(lines: &[String]) -> usize {
+    if lines.is_empty() {
+        0
+    } else {
+        lines.iter().map(|line| line.len() + 1).sum::<usize>()
+    }
+}
+
+fn build_output_blocks(events: &[MatchEvent], cli: &Cli) -> Vec<OutputBlock> {
+    let mut blocks = Vec::new();
+    let mut start = 0usize;
+
+    while start < events.len() {
+        let path = events[start].path.clone();
+        let mut end = start + 1;
+        while end < events.len() && events[end].path == path {
+            end += 1;
+        }
+        blocks.extend(build_file_output_blocks(&path, &events[start..end], cli));
+        start = end;
+    }
+
+    blocks
+}
+
+fn build_file_output_blocks(path: &Path, events: &[MatchEvent], cli: &Cli) -> Vec<OutputBlock> {
+    let Ok(file_lines) = read_file_lines(path) else {
+        return vec![OutputBlock {
+            path: path.to_path_buf(),
+            lines: events
+                .iter()
+                .map(|event| OutputLine {
+                    line_number: event.line_number,
+                    column: event.column,
+                    text: event.text.clone(),
+                    submatches: event.submatches.clone(),
+                    is_match: true,
+                })
+                .collect(),
+        }];
+    };
+
+    let mut ranges = Vec::<(usize, usize)>::new();
+    for event in events {
+        let start_line = event.line_number.saturating_sub(cli.before_context).max(1);
+        let end_line = (event.line_number + cli.after_context).min(file_lines.len());
+        if let Some(previous) = ranges.last_mut() {
+            if start_line <= previous.1 + 1 {
+                previous.1 = previous.1.max(end_line);
+                continue;
+            }
+        }
+        ranges.push((start_line, end_line));
+    }
+
+    ranges
+        .into_iter()
+        .map(|(start_line, end_line)| OutputBlock {
+            path: path.to_path_buf(),
+            lines: (start_line..=end_line)
+                .map(|line_number| {
+                    if let Some(event) = events.iter().find(|item| item.line_number == line_number)
+                    {
+                        OutputLine {
+                            line_number,
+                            column: event.column,
+                            text: event.text.clone(),
+                            submatches: event.submatches.clone(),
+                            is_match: true,
+                        }
+                    } else {
+                        OutputLine {
+                            line_number,
+                            column: None,
+                            text: file_lines[line_number - 1].clone(),
+                            submatches: Vec::new(),
+                            is_match: false,
+                        }
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn render_standard_line(
+    path: &Path,
+    line: &OutputLine,
+    rendered_text: &str,
+    cli: &Cli,
+    show_heading: bool,
+) -> String {
+    let separator = if line.is_match { ":" } else { "-" };
+    let show_line_numbers =
+        cli.line_numbers || cli.show_column || cli.before_context > 0 || cli.after_context > 0;
+
+    if show_heading {
+        render_standard_suffix(line, rendered_text, show_line_numbers, separator)
+    } else if show_path_in_standard_output(cli) {
+        format!(
+            "{}{}{}",
+            path.display(),
+            separator,
+            render_standard_suffix(line, rendered_text, show_line_numbers, separator)
+        )
+    } else {
+        render_standard_suffix(line, rendered_text, show_line_numbers, separator)
+    }
+}
+
+fn render_standard_suffix(
+    line: &OutputLine,
+    rendered_text: &str,
+    show_line_numbers: bool,
+    separator: &str,
+) -> String {
+    if show_line_numbers {
+        if let Some(column) = line.column {
+            if line.is_match {
+                format!(
+                    "{}{}{}:{}",
+                    line.line_number, separator, column, rendered_text
+                )
+            } else {
+                format!("{}{}{}", line.line_number, separator, rendered_text)
+            }
+        } else {
+            format!("{}{}{}", line.line_number, separator, rendered_text)
+        }
+    } else {
+        rendered_text.to_owned()
+    }
+}
+
+fn color_enabled(cli: &Cli) -> bool {
+    match cli.color_mode {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => io::stdout().is_terminal(),
+    }
+}
+
+fn ranked_before_context(cli: &Cli) -> usize {
+    if cli.context_explicit {
+        cli.before_context
+    } else {
+        DEFAULT_CONTEXT_LINES
+    }
+}
+
+fn ranked_after_context(cli: &Cli) -> usize {
+    if cli.context_explicit {
+        cli.after_context
+    } else {
+        DEFAULT_CONTEXT_LINES
+    }
+}
+
+fn highlight_text(text: &str, submatches: &[(usize, usize)]) -> String {
+    if submatches.is_empty() {
+        return text.to_owned();
+    }
+    let bytes = text.as_bytes();
+    let mut rendered = String::new();
+    let mut last = 0usize;
+    for (start, end) in submatches {
+        if *start > last {
+            rendered.push_str(&String::from_utf8_lossy(&bytes[last..*start]));
+        }
+        rendered.push_str("\u{1b}[31m");
+        rendered.push_str(&String::from_utf8_lossy(&bytes[*start..*end]));
+        rendered.push_str("\u{1b}[0m");
+        last = *end;
+    }
+    if last < bytes.len() {
+        rendered.push_str(&String::from_utf8_lossy(&bytes[last..]));
+    }
+    rendered
+}
+
+fn find_submatches(matcher: &grep_regex::RegexMatcher, line_bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut submatches = Vec::new();
+    let mut at = 0usize;
+    while at <= line_bytes.len() {
+        let Some(found) = matcher.find_at(line_bytes, at).ok().flatten() else {
+            break;
+        };
+        submatches.push((found.start(), found.end()));
+        at = if found.end() > at {
+            found.end()
+        } else {
+            at + 1
+        };
+    }
+    submatches
+}
+
+fn trim_line_ending_bytes(line: &[u8]) -> &[u8] {
+    if let Some(stripped) = line.strip_suffix(b"\r\n") {
+        stripped
+    } else if let Some(stripped) = line.strip_suffix(b"\n") {
+        stripped
+    } else if let Some(stripped) = line.strip_suffix(b"\r") {
+        stripped
+    } else {
+        line
+    }
+}
+
+fn json_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+struct JsonDuration {
+    secs: u64,
+    nanos: u32,
+    human: String,
+}
+
+impl JsonDuration {
+    fn render(&self) -> String {
+        format!(
+            "{{\"secs\":{},\"nanos\":{},\"human\":\"{}\"}}",
+            self.secs, self.nanos, self.human
+        )
+    }
+}
+
+fn json_duration(duration: Duration) -> JsonDuration {
+    JsonDuration {
+        secs: duration.as_secs(),
+        nanos: duration.subsec_nanos(),
+        human: format!("{:.6}s", duration.as_secs_f64()),
+    }
+}
+
+fn json_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn show_path_in_standard_output(cli: &Cli) -> bool {
+    !(cli.roots.len() == 1 && cli.roots[0].is_file())
 }
 
 fn score_line_against_query(query: &Query, normalized_text: &str) -> (Vec<usize>, f64) {
@@ -895,6 +2053,36 @@ mod tests {
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn test_cli(root: &Path, query: Option<&str>) -> Cli {
+        Cli {
+            query: query.map(ToOwned::to_owned),
+            roots: vec![root.to_path_buf()],
+            files_mode: query.is_none(),
+            match_mode: MatchMode::Regex,
+            case_mode: CaseMode::Smart,
+            output_mode: SearchOutputMode::Ranked,
+            show_all: false,
+            top_k: DEFAULT_TOP_K,
+            max_candidate_lines: DEFAULT_MAX_CANDIDATE_LINES,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: false,
+            max_snippets: DEFAULT_MAX_SNIPPETS,
+            globs: Vec::new(),
+            type_names: Vec::new(),
+            type_not_names: Vec::new(),
+            line_numbers: false,
+            show_column: false,
+            heading: false,
+            color_mode: ColorMode::Never,
+            word_regexp: false,
+            line_regexp: false,
+            hidden: false,
+            no_ignore: false,
+            follow_links: false,
+        }
+    }
+
     #[test]
     fn normalize_text_splits_camel_case_and_symbols() {
         assert_eq!(
@@ -939,18 +2127,13 @@ mod tests {
         fs::write(root.join("utils.go"), "retryTimeout := 5\n").expect("write utils.go");
 
         let cli = Cli {
-            query: Some("timeout config".to_owned()),
-            roots: vec![root.clone()],
-            files_mode: false,
             match_mode: MatchMode::FixedStrings,
             top_k: 3,
-            max_candidate_lines: DEFAULT_MAX_CANDIDATE_LINES,
-            context_lines: 1,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
             max_snippets: 2,
-            hidden: false,
-            no_ignore: false,
-            follow_links: false,
-            case_sensitive: false,
+            ..test_cli(&root, Some("timeout config"))
         };
         let report = execute_search(&cli).expect("report");
         assert_eq!(
@@ -969,18 +2152,13 @@ mod tests {
         fs::write(root.join("visible.txt"), "timeout config\n").expect("write visible.txt");
 
         let cli = Cli {
-            query: Some("timeout config".to_owned()),
-            roots: vec![root.clone()],
-            files_mode: false,
             match_mode: MatchMode::FixedStrings,
             top_k: 5,
-            max_candidate_lines: DEFAULT_MAX_CANDIDATE_LINES,
-            context_lines: 1,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
             max_snippets: 2,
-            hidden: false,
-            no_ignore: false,
-            follow_links: false,
-            case_sensitive: false,
+            ..test_cli(&root, Some("timeout config"))
         };
         let report = execute_search(&cli).expect("report");
         assert_eq!(report.results.len(), 1);
@@ -1000,6 +2178,7 @@ mod tests {
         assert!(cli.query.is_none());
         assert_eq!(cli.roots, vec![PathBuf::from("./hypotheses")]);
         assert_eq!(cli.match_mode, MatchMode::Regex);
+        assert_eq!(cli.case_mode, CaseMode::Smart);
     }
 
     #[test]
@@ -1016,26 +2195,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_common_rg_flags() {
+        let cli = parse_args_from([
+            "-i".to_owned(),
+            "-g*.rs".to_owned(),
+            "-tpy".to_owned(),
+            "-Tjson".to_owned(),
+            "-A2".to_owned(),
+            "-B1".to_owned(),
+            "-w".to_owned(),
+            "-x".to_owned(),
+            "-c".to_owned(),
+            "python".to_owned(),
+            ".".to_owned(),
+        ])
+        .expect("parse args");
+        assert_eq!(cli.case_mode, CaseMode::Insensitive);
+        assert_eq!(cli.globs, vec!["*.rs".to_owned()]);
+        assert_eq!(cli.type_names, vec!["py".to_owned()]);
+        assert_eq!(cli.type_not_names, vec!["json".to_owned()]);
+        assert_eq!(cli.before_context, 1);
+        assert_eq!(cli.after_context, 2);
+        assert!(cli.word_regexp);
+        assert!(cli.line_regexp);
+        assert_eq!(cli.output_mode, SearchOutputMode::Count);
+    }
+
+    #[test]
+    fn parse_args_accepts_ranked_all_flag() {
+        let cli = parse_args_from([
+            "--ranked".to_owned(),
+            "--all".to_owned(),
+            "timeout".to_owned(),
+            ".".to_owned(),
+        ])
+        .expect("parse args");
+        assert_eq!(cli.output_mode, SearchOutputMode::Ranked);
+        assert!(cli.show_all);
+    }
+
+    #[test]
     fn list_files_respects_gitignore_by_default() {
         let root = create_test_dir("files-ignore");
         fs::write(root.join(".gitignore"), "ignored.txt\n").expect("write .gitignore");
         fs::write(root.join("ignored.txt"), "ignored\n").expect("write ignored.txt");
         fs::write(root.join("visible.txt"), "visible\n").expect("write visible.txt");
 
-        let cli = Cli {
-            query: None,
-            roots: vec![root.clone()],
-            files_mode: true,
-            match_mode: MatchMode::Regex,
-            top_k: DEFAULT_TOP_K,
-            max_candidate_lines: DEFAULT_MAX_CANDIDATE_LINES,
-            context_lines: DEFAULT_CONTEXT_LINES,
-            max_snippets: DEFAULT_MAX_SNIPPETS,
-            hidden: false,
-            no_ignore: false,
-            follow_links: false,
-            case_sensitive: false,
-        };
+        let cli = test_cli(&root, None);
         let files = list_files(&cli).expect("list files");
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -1054,18 +2260,12 @@ mod tests {
         fs::write(root.join("gamma.txt"), "rust only\n").expect("write gamma.txt");
 
         let cli = Cli {
-            query: Some("whisper|process_all_mp4s|python".to_owned()),
-            roots: vec![root.clone()],
-            files_mode: false,
-            match_mode: MatchMode::Regex,
             top_k: 10,
-            max_candidate_lines: DEFAULT_MAX_CANDIDATE_LINES,
-            context_lines: 1,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
             max_snippets: 1,
-            hidden: false,
-            no_ignore: false,
-            follow_links: false,
-            case_sensitive: false,
+            ..test_cli(&root, Some("whisper|process_all_mp4s|python"))
         };
         let report = execute_search(&cli).expect("report");
         let file_names: Vec<_> = report
@@ -1076,6 +2276,301 @@ mod tests {
         assert!(file_names.contains(&"alpha.txt"));
         assert!(file_names.contains(&"beta.txt"));
         assert!(!file_names.contains(&"gamma.txt"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn ranked_all_shows_all_files_and_snippets() {
+        let root = create_test_dir("ranked-all");
+        fs::write(root.join("one.txt"), "alpha term\nterm again\n").expect("write one.txt");
+        fs::write(root.join("two.txt"), "term here\nmiddle\nterm there\n").expect("write two.txt");
+
+        let limited_cli = Cli {
+            top_k: 1,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: true,
+            max_snippets: 1,
+            ..test_cli(&root, Some("term"))
+        };
+        let limited = execute_search(&limited_cli).expect("limited search");
+        assert_eq!(limited.results.len(), 1);
+        assert_eq!(limited.results[0].snippets.len(), 1);
+
+        let all_cli = Cli {
+            show_all: true,
+            top_k: 1,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: true,
+            max_snippets: 1,
+            ..test_cli(&root, Some("term"))
+        };
+        let all = execute_search(&all_cli).expect("all search");
+        assert_eq!(all.results.len(), 2);
+        assert!(all.results.iter().any(|result| result.snippets.len() > 1));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execute_search_respects_case_modes() {
+        let root = create_test_dir("case");
+        fs::write(root.join("sample.txt"), "Timeout value\n").expect("write sample.txt");
+
+        let sensitive = Cli {
+            case_mode: CaseMode::Sensitive,
+            top_k: 5,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: true,
+            max_snippets: 1,
+            ..test_cli(&root, Some("timeout"))
+        };
+        assert_eq!(
+            execute_search(&sensitive).expect("sensitive").results.len(),
+            0
+        );
+
+        let insensitive = Cli {
+            case_mode: CaseMode::Insensitive,
+            ..sensitive.clone()
+        };
+        assert_eq!(
+            execute_search(&insensitive)
+                .expect("insensitive")
+                .results
+                .len(),
+            1
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execute_search_respects_glob_and_type_filters() {
+        let root = create_test_dir("filters");
+        fs::write(root.join("keep.rs"), "timeout config\n").expect("write keep.rs");
+        fs::write(root.join("skip.py"), "timeout config\n").expect("write skip.py");
+
+        let glob_cli = Cli {
+            top_k: 5,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: true,
+            max_snippets: 1,
+            globs: vec!["*.rs".to_owned()],
+            ..test_cli(&root, Some("timeout"))
+        };
+        let glob_report = execute_search(&glob_cli).expect("glob report");
+        assert_eq!(glob_report.results.len(), 1);
+        assert_eq!(
+            glob_report.results[0].path.file_name(),
+            Some(std::ffi::OsStr::new("keep.rs"))
+        );
+
+        let type_cli = Cli {
+            globs: Vec::new(),
+            type_names: vec!["py".to_owned()],
+            ..glob_cli
+        };
+        let type_report = execute_search(&type_cli).expect("type report");
+        assert_eq!(type_report.results.len(), 1);
+        assert_eq!(
+            type_report.results[0].path.file_name(),
+            Some(std::ffi::OsStr::new("skip.py"))
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execute_search_respects_word_and_line_regexp() {
+        let root = create_test_dir("boundaries");
+        fs::write(root.join("sample.txt"), "cpython\npython\npython worker\n")
+            .expect("write sample.txt");
+
+        let word_cli = Cli {
+            top_k: 5,
+            before_context: 0,
+            after_context: 0,
+            context_explicit: true,
+            max_snippets: 5,
+            word_regexp: true,
+            ..test_cli(&root, Some("python"))
+        };
+        let word_report = execute_search(&word_cli).expect("word report");
+        assert_eq!(word_report.results.len(), 1);
+        assert_eq!(word_report.results[0].match_count, 2);
+
+        let line_cli = Cli {
+            line_regexp: true,
+            ..word_cli
+        };
+        let line_report = execute_search(&line_cli).expect("line report");
+        assert_eq!(line_report.results.len(), 1);
+        assert_eq!(line_report.results[0].match_count, 1);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execute_output_modes_and_context_work() {
+        let root = create_test_dir("outputs");
+        fs::write(root.join("one.txt"), "zero\none hit\ntwo\nthree\n").expect("write one.txt");
+        fs::write(root.join("two.txt"), "zero\n").expect("write two.txt");
+
+        let base_cli = Cli {
+            top_k: 5,
+            before_context: 1,
+            after_context: 2,
+            context_explicit: true,
+            max_snippets: 5,
+            ..test_cli(&root, Some("hit"))
+        };
+
+        let report = execute_search(&base_cli).expect("report");
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].snippets[0].start_line, 1);
+        assert_eq!(report.results[0].snippets[0].end_line, 4);
+
+        let files_with_matches = execute_files_with_matches(&base_cli).expect("files with matches");
+        assert_eq!(files_with_matches.len(), 1);
+        assert_eq!(
+            files_with_matches[0].file_name(),
+            Some(std::ffi::OsStr::new("one.txt"))
+        );
+
+        let files_without_match =
+            execute_files_without_match(&base_cli).expect("files without match");
+        assert_eq!(files_without_match.len(), 1);
+        assert_eq!(
+            files_without_match[0].file_name(),
+            Some(std::ffi::OsStr::new("two.txt"))
+        );
+
+        let counts = execute_count(&base_cli).expect("counts");
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].count, 1);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn count_output_omits_path_for_single_file() {
+        let root = create_test_dir("count-single");
+        let file = root.join("sample.txt");
+        fs::write(&file, "foo\nfoo\n").expect("write sample.txt");
+
+        let cli = Cli {
+            output_mode: SearchOutputMode::Count,
+            ..test_cli(&file, Some("foo"))
+        };
+        let counts = execute_count(&cli).expect("counts");
+        let output = render_count_list(&counts, &cli);
+        assert_eq!(output, "2");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn json_output_includes_rg_style_events_and_offsets() {
+        let root = create_test_dir("json");
+        let file = root.join("sample.txt");
+        fs::write(&file, "zero\none hit\ntwo\n").expect("write sample.txt");
+
+        let cli = Cli {
+            output_mode: SearchOutputMode::Json,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
+            ..test_cli(&file, Some("hit"))
+        };
+        let result = execute_json_search(&cli).expect("json output");
+        assert!(result.had_match);
+        let output = result.output;
+        assert!(output.contains("\"type\":\"begin\""));
+        assert!(output.contains("\"type\":\"context\""));
+        assert!(output.contains("\"type\":\"match\""));
+        assert!(output.contains("\"type\":\"end\""));
+        assert!(output.contains("\"type\":\"summary\""));
+        assert!(output.contains("\"absolute_offset\":5"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn json_output_reports_summary_for_no_match() {
+        let root = create_test_dir("json-nohit");
+        let file = root.join("sample.txt");
+        fs::write(&file, "bar\n").expect("write sample.txt");
+
+        let cli = Cli {
+            output_mode: SearchOutputMode::Json,
+            ..test_cli(&file, Some("foo"))
+        };
+        let result = execute_json_search(&cli).expect("json output");
+        assert!(!result.had_match);
+        let output = result.output;
+        assert!(!output.contains("\"type\":\"begin\""));
+        assert!(output.contains("\"type\":\"summary\""));
+        assert!(output.contains("\"searches\":1"));
+        assert!(output.contains("\"searches_with_match\":0"));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn run_returns_no_match_exit_code_for_standard_search() {
+        let root = create_test_dir("exit-no-match");
+        let file = root.join("sample.txt");
+        fs::write(&file, "bar\n").expect("write sample.txt");
+
+        let cli = Cli {
+            output_mode: SearchOutputMode::Standard,
+            ..test_cli(&file, Some("foo"))
+        };
+        let outcome = execute_cli(&cli).expect("outcome");
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.output.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn standard_output_omits_path_for_single_file_by_default() {
+        let root = create_test_dir("standard-single");
+        let file = root.join("sample.txt");
+        fs::write(&file, "zero\none hit\ntwo\n").expect("write sample.txt");
+
+        let cli = Cli {
+            output_mode: SearchOutputMode::Standard,
+            ..test_cli(&file, Some("hit"))
+        };
+        let events = execute_standard_search(&cli).expect("events");
+        let output = render_standard_output(&events, &cli);
+        assert_eq!(output, "one hit");
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn standard_output_context_uses_rg_style_separators() {
+        let root = create_test_dir("standard-context");
+        let file = root.join("sample.txt");
+        fs::write(&file, "zero\none hit\ntwo\n").expect("write sample.txt");
+
+        let cli = Cli {
+            output_mode: SearchOutputMode::Standard,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
+            ..test_cli(&file, Some("hit"))
+        };
+        let events = execute_standard_search(&cli).expect("events");
+        let output = render_standard_output(&events, &cli);
+        assert_eq!(output, "1-zero\n2:one hit\n3-two");
 
         fs::remove_dir_all(root).expect("cleanup");
     }
