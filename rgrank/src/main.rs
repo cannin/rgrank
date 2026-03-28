@@ -43,6 +43,7 @@ const HELP_BODY: &str = r#"Usage:
 Options:
       --files                 List searchable file paths without searching contents
       --debug                 Show debug warnings for files that could not be searched
+      --binary                Search raw binary files instead of stopping at NUL bytes
   -F, --fixed-strings         Treat the query as literal ranked terms instead of a regex
   -i, --ignore-case           Force case insensitive matching
   -s, --case-sensitive        Force case sensitive matching
@@ -57,6 +58,8 @@ Options:
   -g, --glob <pattern>        Include or exclude files using rg-style globs
   -t, --type <type>           Only search files of the given type
   -T, --type-not <type>       Exclude files of the given type
+  -z, --search-zip            Search supported archive/compressed formats (.zip, .tar, .tar.gz, .tgz)
+  -X, --search-extract        Search all supported extracted formats (.docx, .pdf, .pptx, .xlsx, .zip, .tar, .tar.gz, .tgz)
   -n                          Show line numbers in standard output
       --column                Show the first match column in standard output
       --heading               Group matches under file headings
@@ -82,8 +85,11 @@ Behavior:
   - Use -F/--fixed-strings for literal term matching.
   - Standard rg-style output is the default.
   - Use --ranked for ranked file/snippet output.
+  - Use --binary to search raw binary files with NUL bytes.
   - Use -g '*.ext' to include an extension and -g '!*.ext' to exclude one.
   - Use -t TYPE to include a built-in file type and -T TYPE to exclude one.
+  - Use -z/--search-zip for supported archive/compressed formats.
+  - Use -X/--search-extract for all supported extracted/container formats.
   - Use --debug to show skipped-file and extractor warnings.
   - Standard output defaults to zero context; ranked snippets default to 2 lines before/after.
   - Respects .gitignore/.ignore by default.
@@ -126,6 +132,9 @@ struct Cli {
     roots: Vec<PathBuf>,
     files_mode: bool,
     debug: bool,
+    search_binary: bool,
+    search_zip: bool,
+    search_extract: bool,
     match_mode: MatchMode,
     case_mode: CaseMode,
     output_mode: SearchOutputMode,
@@ -593,6 +602,9 @@ where
     let mut follow_links = false;
     let mut files_mode = false;
     let mut debug = false;
+    let mut search_binary = false;
+    let mut search_zip = false;
+    let mut search_extract = false;
     let mut match_mode = MatchMode::Regex;
     let mut case_mode = CaseMode::Smart;
     let mut output_mode = SearchOutputMode::Standard;
@@ -615,10 +627,13 @@ where
             "-v" | "--version" => return Ok(ParseOutcome::Version),
             "--files" => files_mode = true,
             "--debug" => debug = true,
+            "--binary" => search_binary = true,
             "-F" | "--fixed-strings" => match_mode = MatchMode::FixedStrings,
             "-i" | "--ignore-case" => case_mode = CaseMode::Insensitive,
             "-s" | "--case-sensitive" => case_mode = CaseMode::Sensitive,
             "-S" | "--smart-case" => case_mode = CaseMode::Smart,
+            "-z" | "--search-zip" => search_zip = true,
+            "-X" | "--search-extract" => search_extract = true,
             "-n" => line_numbers = true,
             "--column" => show_column = true,
             "--heading" => heading = true,
@@ -766,6 +781,9 @@ where
         roots,
         files_mode,
         debug,
+        search_binary,
+        search_zip,
+        search_extract,
         match_mode,
         case_mode,
         output_mode,
@@ -809,6 +827,13 @@ fn search_warning_message(cli: &Cli, path: &Path, error: &dyn std::fmt::Display)
 fn maybe_print_search_warning(cli: &Cli, path: &Path, error: &dyn std::fmt::Display) {
     if let Some(message) = search_warning_message(cli, path, error) {
         eprintln!("{message}");
+    }
+}
+
+fn extraction_options(cli: &Cli) -> extract::ExtractionOptions {
+    extract::ExtractionOptions {
+        search_zip: cli.search_zip,
+        search_extract: cli.search_extract,
     }
 }
 
@@ -933,7 +958,7 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
         .ok_or_else(|| "query is required unless --files is set".to_owned())?;
     let query = Query::from_raw(query_text)?;
     let matcher = build_matcher(cli, query_text, &query)?;
-    let mut searcher = build_searcher(true);
+    let mut searcher = build_searcher(true, cli.search_binary);
 
     let walker_builder = build_walk_builder(cli)?;
 
@@ -957,7 +982,8 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
         scanned_files += 1;
         let remaining_budget = cli.max_candidate_lines.saturating_sub(candidate_lines);
         let mut sink = CollectingSink::new(query.clone(), remaining_budget);
-        if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
+        if let Err(error) = search_target(cli, &mut searcher, &matcher, dir_entry.path(), &mut sink)
+        {
             maybe_print_search_warning(cli, dir_entry.path(), &error);
             continue;
         }
@@ -985,6 +1011,7 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
     let after_context = ranked_after_context(cli);
     for result in &mut ranked {
         result.snippets = build_snippets(
+            cli,
             &result.path,
             before_context,
             after_context,
@@ -1011,7 +1038,7 @@ fn execute_files_with_matches(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>>
     let query = Query::from_raw(query_text)?;
     let matcher = build_matcher(cli, query_text, &query)?;
     let walker_builder = build_walk_builder(cli)?;
-    let mut searcher = build_searcher(false);
+    let mut searcher = build_searcher(false, cli.search_binary);
     let mut files = Vec::new();
 
     for entry in walker_builder.build() {
@@ -1021,7 +1048,7 @@ fn execute_files_with_matches(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>>
         if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
             continue;
         }
-        let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), true) {
+        let count = match search_file_count(cli, &mut searcher, &matcher, dir_entry.path(), true) {
             Ok(count) => count,
             Err(error) => {
                 maybe_print_search_warning(cli, dir_entry.path(), &error);
@@ -1044,7 +1071,7 @@ fn execute_files_without_match(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>
     let query = Query::from_raw(query_text)?;
     let matcher = build_matcher(cli, query_text, &query)?;
     let walker_builder = build_walk_builder(cli)?;
-    let mut searcher = build_searcher(false);
+    let mut searcher = build_searcher(false, cli.search_binary);
     let mut files = Vec::new();
 
     for entry in walker_builder.build() {
@@ -1054,7 +1081,7 @@ fn execute_files_without_match(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>
         if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
             continue;
         }
-        let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), true) {
+        let count = match search_file_count(cli, &mut searcher, &matcher, dir_entry.path(), true) {
             Ok(count) => count,
             Err(error) => {
                 maybe_print_search_warning(cli, dir_entry.path(), &error);
@@ -1077,7 +1104,7 @@ fn execute_count(cli: &Cli) -> Result<Vec<CountEntry>, Box<dyn Error>> {
     let query = Query::from_raw(query_text)?;
     let matcher = build_matcher(cli, query_text, &query)?;
     let walker_builder = build_walk_builder(cli)?;
-    let mut searcher = build_searcher(false);
+    let mut searcher = build_searcher(false, cli.search_binary);
     let mut counts = Vec::new();
 
     for entry in walker_builder.build() {
@@ -1087,7 +1114,7 @@ fn execute_count(cli: &Cli) -> Result<Vec<CountEntry>, Box<dyn Error>> {
         if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
             continue;
         }
-        let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), false) {
+        let count = match search_file_count(cli, &mut searcher, &matcher, dir_entry.path(), false) {
             Ok(count) => count,
             Err(error) => {
                 maybe_print_search_warning(cli, dir_entry.path(), &error);
@@ -1134,10 +1161,14 @@ fn build_matcher(
     Ok(matcher)
 }
 
-fn build_searcher(line_numbers: bool) -> Searcher {
+fn build_searcher(line_numbers: bool, search_binary: bool) -> Searcher {
     let mut searcher_builder = SearcherBuilder::new();
     searcher_builder.line_number(line_numbers);
-    searcher_builder.binary_detection(BinaryDetection::quit(0));
+    searcher_builder.binary_detection(if search_binary {
+        BinaryDetection::convert(0)
+    } else {
+        BinaryDetection::quit(0)
+    });
     searcher_builder.build()
 }
 
@@ -1145,27 +1176,34 @@ fn build_searcher_with_context(
     line_numbers: bool,
     before_context: usize,
     after_context: usize,
+    search_binary: bool,
 ) -> Searcher {
     let mut searcher_builder = SearcherBuilder::new();
     searcher_builder.line_number(line_numbers);
     searcher_builder.before_context(before_context);
     searcher_builder.after_context(after_context);
-    searcher_builder.binary_detection(BinaryDetection::quit(0));
+    searcher_builder.binary_detection(if search_binary {
+        BinaryDetection::convert(0)
+    } else {
+        BinaryDetection::quit(0)
+    });
     searcher_builder.build()
 }
 
 fn search_file_count(
+    cli: &Cli,
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
     path: &Path,
     stop_after_first: bool,
 ) -> Result<usize, Box<dyn Error>> {
     let mut sink = CountingSink::new(stop_after_first);
-    search_target(searcher, matcher, path, &mut sink)?;
+    search_target(cli, searcher, matcher, path, &mut sink)?;
     Ok(sink.match_count)
 }
 
 fn search_target<S>(
+    cli: &Cli,
     searcher: &mut Searcher,
     matcher: &grep_regex::RegexMatcher,
     path: &Path,
@@ -1174,7 +1212,7 @@ fn search_target<S>(
 where
     S: Sink<Error = io::Error>,
 {
-    match extract::extract_searchable_text(path) {
+    match extract::extract_searchable_text(path, extraction_options(cli)) {
         Ok(Some(text)) => searcher.search_reader(matcher, Cursor::new(text.into_bytes()), sink),
         Ok(None) => searcher.search_path(matcher, path, sink),
         Err(error) => Err(io::Error::other(error.to_string())),
@@ -1189,7 +1227,7 @@ fn execute_standard_search(cli: &Cli) -> Result<Vec<MatchEvent>, Box<dyn Error>>
     let query = Query::from_raw(query_text)?;
     let matcher = build_matcher(cli, query_text, &query)?;
     let walker_builder = build_walk_builder(cli)?;
-    let mut searcher = build_searcher(true);
+    let mut searcher = build_searcher(true, cli.search_binary);
     let mut events = Vec::new();
     let capture_matches =
         cli.show_column || color_enabled(cli) || cli.output_mode == SearchOutputMode::Json;
@@ -1206,7 +1244,8 @@ fn execute_standard_search(cli: &Cli) -> Result<Vec<MatchEvent>, Box<dyn Error>>
             matcher.clone(),
             capture_matches,
         );
-        if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
+        if let Err(error) = search_target(cli, &mut searcher, &matcher, dir_entry.path(), &mut sink)
+        {
             maybe_print_search_warning(cli, dir_entry.path(), &error);
             continue;
         }
@@ -1224,7 +1263,12 @@ fn execute_json_search(cli: &Cli) -> Result<JsonSearchResult, Box<dyn Error>> {
     let query = Query::from_raw(query_text)?;
     let matcher = build_matcher(cli, query_text, &query)?;
     let walker_builder = build_walk_builder(cli)?;
-    let mut searcher = build_searcher_with_context(true, cli.before_context, cli.after_context);
+    let mut searcher = build_searcher_with_context(
+        true,
+        cli.before_context,
+        cli.after_context,
+        cli.search_binary,
+    );
     let started_at = Instant::now();
     let mut totals = JsonTotals::default();
     let mut file_results = Vec::new();
@@ -1238,7 +1282,8 @@ fn execute_json_search(cli: &Cli) -> Result<JsonSearchResult, Box<dyn Error>> {
         }
         totals.searches += 1;
         let mut sink = JsonEventSink::new(dir_entry.path().to_path_buf(), matcher.clone());
-        if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
+        if let Err(error) = search_target(cli, &mut searcher, &matcher, dir_entry.path(), &mut sink)
+        {
             maybe_print_search_warning(cli, dir_entry.path(), &error);
             continue;
         }
@@ -1343,13 +1388,14 @@ fn score_candidate(query: &Query, stats: &CorpusStats, candidate: FileCandidate)
 }
 
 fn build_snippets(
+    cli: &Cli,
     path: &Path,
     before_context: usize,
     after_context: usize,
     max_snippets: usize,
     placeholder_snippets: &[Snippet],
 ) -> Vec<Snippet> {
-    let Ok(file_lines) = read_file_lines(path) else {
+    let Ok(file_lines) = read_file_lines(path, cli) else {
         return placeholder_snippets
             .iter()
             .take(max_snippets)
@@ -1400,8 +1446,8 @@ fn build_snippets(
     merged
 }
 
-fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
-    match extract::extract_searchable_text(path) {
+fn read_file_lines(path: &Path, cli: &Cli) -> io::Result<Vec<String>> {
+    match extract::extract_searchable_text(path, extraction_options(cli)) {
         Ok(Some(text)) => return Ok(text.lines().map(ToOwned::to_owned).collect()),
         Ok(None) => {}
         Err(error) => return Err(io::Error::other(error.to_string())),
@@ -1652,7 +1698,7 @@ fn build_output_blocks(events: &[MatchEvent], cli: &Cli) -> Vec<OutputBlock> {
 }
 
 fn build_file_output_blocks(path: &Path, events: &[MatchEvent], cli: &Cli) -> Vec<OutputBlock> {
-    let Ok(file_lines) = read_file_lines(path) else {
+    let Ok(file_lines) = read_file_lines(path, cli) else {
         return vec![OutputBlock {
             path: path.to_path_buf(),
             lines: events
@@ -2141,6 +2187,9 @@ mod tests {
             roots: vec![root.to_path_buf()],
             files_mode: query.is_none(),
             debug: false,
+            search_binary: false,
+            search_zip: false,
+            search_extract: false,
             match_mode: MatchMode::Regex,
             case_mode: CaseMode::Smart,
             output_mode: SearchOutputMode::Ranked,
@@ -2287,8 +2336,11 @@ mod tests {
     fn parse_args_accepts_common_rg_flags() {
         let cli = parse_test_cli([
             "--debug".to_owned(),
+            "--binary".to_owned(),
             "-i".to_owned(),
             "-L".to_owned(),
+            "-z".to_owned(),
+            "-X".to_owned(),
             "-g*.rs".to_owned(),
             "-tpy".to_owned(),
             "-Tjson".to_owned(),
@@ -2307,6 +2359,9 @@ mod tests {
         assert_eq!(cli.before_context, 1);
         assert_eq!(cli.after_context, 2);
         assert!(cli.debug);
+        assert!(cli.search_binary);
+        assert!(cli.search_zip);
+        assert!(cli.search_extract);
         assert!(cli.word_regexp);
         assert!(cli.line_regexp);
         assert!(cli.follow_links);
@@ -2604,6 +2659,7 @@ mod tests {
 
         let cli = Cli {
             match_mode: MatchMode::FixedStrings,
+            search_extract: true,
             before_context: 1,
             after_context: 1,
             context_explicit: true,
@@ -2629,6 +2685,71 @@ mod tests {
     }
 
     #[test]
+    fn extracted_formats_require_explicit_flags() {
+        let root = create_test_dir("extract-flags");
+        let docx_file = root.join("sample.docx");
+        let zip_file = root.join("bundle.zip");
+        create_test_docx(&docx_file, &["cortisol level in serum"]);
+        write_zip(
+            &zip_file,
+            &[(
+                "notes.txt".to_owned(),
+                b"archived cortisol finding\n".to_vec(),
+            )],
+        );
+
+        let default_docx = Cli {
+            match_mode: MatchMode::FixedStrings,
+            ..test_cli(&docx_file, Some("cortisol"))
+        };
+        assert_eq!(
+            execute_search(&default_docx)
+                .expect("docx default")
+                .results
+                .len(),
+            0
+        );
+
+        let extract_docx = Cli {
+            search_extract: true,
+            ..default_docx
+        };
+        assert_eq!(
+            execute_search(&extract_docx)
+                .expect("docx extract")
+                .results
+                .len(),
+            1
+        );
+
+        let default_zip = Cli {
+            match_mode: MatchMode::FixedStrings,
+            ..test_cli(&zip_file, Some("cortisol"))
+        };
+        assert_eq!(
+            execute_search(&default_zip)
+                .expect("zip default")
+                .results
+                .len(),
+            0
+        );
+
+        let search_zip = Cli {
+            search_zip: true,
+            ..default_zip
+        };
+        assert_eq!(
+            execute_search(&search_zip)
+                .expect("zip search")
+                .results
+                .len(),
+            1
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn execute_search_supports_zip_archives() {
         let root = create_test_dir("zip-archive");
         let file = root.join("bundle.zip");
@@ -2642,6 +2763,7 @@ mod tests {
 
         let cli = Cli {
             match_mode: MatchMode::FixedStrings,
+            search_zip: true,
             before_context: 1,
             after_context: 1,
             context_explicit: true,
@@ -2679,6 +2801,7 @@ mod tests {
 
         let cli = Cli {
             match_mode: MatchMode::FixedStrings,
+            search_zip: true,
             top_k: 10,
             before_context: 0,
             after_context: 0,
@@ -2706,6 +2829,7 @@ mod tests {
 
         let cli = Cli {
             match_mode: MatchMode::FixedStrings,
+            search_zip: true,
             before_context: 2,
             after_context: 1,
             context_explicit: true,

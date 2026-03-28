@@ -9,7 +9,7 @@ It uses:
 - `ignore` for recursive walking with `.gitignore` and `.ignore` support
 - `grep-regex` for regex and fixed-string matching
 - `grep-searcher` for efficient line collection
-- in-process extractors for Office documents, PDFs, and archives
+- in-process extractors for Office documents, PDFs, and archives when you opt in with `-X` or `-z`
 
 Ranking is file-level and combines:
 
@@ -88,6 +88,7 @@ Default rg-style examples:
 ./rgrank/target/release/rgrank --heading 'timeout|config' .
 ./rgrank/target/release/rgrank --json 'timeout|config' .
 ./rgrank/target/release/rgrank -B1 -A2 'timeout|config' .
+./rgrank/target/release/rgrank --binary 'sqlite' ./data
 ```
 
 Ranked examples:
@@ -96,6 +97,8 @@ Ranked examples:
 ./rgrank/target/release/rgrank --ranked --top-k 10 --context 3 --max-snippets 2 "timeout config" .
 ./rgrank/target/release/rgrank --ranked --all "timeout config" .
 ./rgrank/target/release/rgrank -i -g '*.rs' -tpy 'timeout|config' .
+./rgrank/target/release/rgrank -X -F "cortisol level" ./papers
+./rgrank/target/release/rgrank -z 'tumor' ./examples
 ./rgrank/target/release/rgrank -w 'python' .
 ./rgrank/target/release/rgrank -x '^python$' .
 ./rgrank/target/release/rgrank -l 'timeout|config' .
@@ -114,11 +117,20 @@ Ranked examples:
 
 Use `--debug` to show skipped-file and extractor warnings. Without `--debug`, `rgrank` suppresses those per-file warnings and keeps normal output quiet.
 
+By default, `rgrank` keeps simple rg-style behavior for binary-looking files and stops searching when it sees NUL bytes. Use the opt-in flags below when you want special handling:
+
+- `--binary` searches raw binary files instead of stopping at NUL bytes
+- `-z`, `--search-zip` searches supported archive/compressed formats in-process: `.zip`, `.tar`, `.tar.gz`, `.tgz`
+- `-X`, `--search-extract` searches all supported extracted/container formats in-process: `.docx`, `.pdf`, `.pptx`, `.xlsx`, `.zip`, `.tar`, `.tar.gz`, `.tgz`
+
 Common `rg`-style flags supported now:
 
 - `-i`, `-s`, `-S` for case mode control
+- `--binary` for raw binary-file searching
 - `-g` for include/exclude globs
 - `-t` and `-T` for file type filtering
+- `-z` for supported archive/compressed formats
+- `-X` for all supported extracted/container formats
 - `-w` and `-x` for word and whole-line matching
 - `-A`, `-B`, and `-C` for rg-style context output
 - `-n`, `--column`, `--heading`, `--no-heading`, `--json`, and `--color`
@@ -149,7 +161,7 @@ Rule of thumb:
 
 # Extracted formats
 
-`rgrank` can search plain text files directly and can also extract searchable text in-process from:
+With `-X` or `-z`, `rgrank` can search plain text files directly and can also extract searchable text in-process from:
 
 - `.docx`
 - `.pdf`
@@ -161,6 +173,8 @@ Rule of thumb:
 - `.tgz`
 
 Archive handling stays inside the same Rust binary. There are no subprocess adapters. For supported archive members, `rgrank` extracts and searches their contents recursively. Nested archives are also supported up to a bounded recursion depth.
+
+`-X` is the broad switch for all supported extracted/container formats. `-z` is the narrower archive/compressed subset.
 
 # Output modes
 

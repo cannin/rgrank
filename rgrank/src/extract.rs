@@ -18,6 +18,12 @@ use zip::ZipArchive;
 const MAX_ARCHIVE_DEPTH: usize = 4;
 const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractionOptions {
+    pub search_zip: bool,
+    pub search_extract: bool,
+}
+
 fn extractor_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -44,23 +50,30 @@ enum SupportedKind {
     TarGz,
 }
 
-pub fn extract_searchable_text(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
+pub fn extract_searchable_text(
+    path: &Path,
+    options: ExtractionOptions,
+) -> Result<Option<String>, Box<dyn Error>> {
     let display_name = path.to_string_lossy();
     if is_office_lockfile_name(display_name.as_ref()) {
         return Ok(Some(String::new()));
     }
 
-    let Some(_) = detect_supported_kind(display_name.as_ref()) else {
+    let Some(kind) = detect_supported_kind(display_name.as_ref()) else {
         return Ok(None);
     };
+    if !options.enabled(kind) {
+        return Ok(None);
+    }
 
     let bytes = fs::read(path)?;
-    extract_supported_bytes(display_name.as_ref(), &bytes, 0).map(Some)
+    extract_supported_bytes(display_name.as_ref(), &bytes, options, 0).map(Some)
 }
 
 fn extract_supported_bytes(
     name: &str,
     bytes: &[u8],
+    options: ExtractionOptions,
     depth: usize,
 ) -> Result<String, Box<dyn Error>> {
     let Some(kind) = detect_supported_kind(name) else {
@@ -72,11 +85,11 @@ fn extract_supported_bytes(
         SupportedKind::Pdf => extract_pdf_from_bytes(bytes),
         SupportedKind::Pptx => extract_pptx_from_bytes(bytes),
         SupportedKind::Xlsx => extract_xlsx_from_bytes(bytes),
-        SupportedKind::Zip => extract_zip_archive(bytes, depth),
-        SupportedKind::Tar => extract_tar_archive(Cursor::new(bytes), depth),
+        SupportedKind::Zip => extract_zip_archive(bytes, options, depth),
+        SupportedKind::Tar => extract_tar_archive(Cursor::new(bytes), options, depth),
         SupportedKind::TarGz => {
             let decoder = MultiGzDecoder::new(Cursor::new(bytes));
-            extract_tar_archive(decoder, depth)
+            extract_tar_archive(decoder, options, depth)
         }
     })
 }
@@ -84,12 +97,16 @@ fn extract_supported_bytes(
 fn extract_archive_member_text(
     name: &str,
     bytes: &[u8],
+    options: ExtractionOptions,
     depth: usize,
 ) -> Result<Option<String>, Box<dyn Error>> {
     if is_office_lockfile_name(name) {
         return Ok(Some(String::new()));
     }
     if let Some(kind) = detect_supported_kind(name) {
+        if !options.enabled(kind) {
+            return Ok(extract_plain_text(bytes));
+        }
         if depth >= MAX_ARCHIVE_DEPTH
             && matches!(
                 kind,
@@ -98,7 +115,12 @@ fn extract_archive_member_text(
         {
             return Ok(None);
         }
-        return Ok(Some(extract_supported_bytes(name, bytes, depth + 1)?));
+        return Ok(Some(extract_supported_bytes(
+            name,
+            bytes,
+            options,
+            depth + 1,
+        )?));
     }
     Ok(extract_plain_text(bytes))
 }
@@ -139,6 +161,20 @@ impl SupportedKind {
             SupportedKind::Zip => "zip extraction",
             SupportedKind::Tar => "tar extraction",
             SupportedKind::TarGz => "tar.gz extraction",
+        }
+    }
+}
+
+impl ExtractionOptions {
+    fn enabled(self, kind: SupportedKind) -> bool {
+        match kind {
+            SupportedKind::Docx
+            | SupportedKind::Pdf
+            | SupportedKind::Pptx
+            | SupportedKind::Xlsx => self.search_extract,
+            SupportedKind::Zip | SupportedKind::Tar | SupportedKind::TarGz => {
+                self.search_extract || self.search_zip
+            }
         }
     }
 }
@@ -243,7 +279,11 @@ fn extract_xlsx_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
     Ok(clean_extracted_text(output))
 }
 
-fn extract_zip_archive(bytes: &[u8], depth: usize) -> Result<String, Box<dyn Error>> {
+fn extract_zip_archive(
+    bytes: &[u8],
+    options: ExtractionOptions,
+    depth: usize,
+) -> Result<String, Box<dyn Error>> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
     let mut output = String::new();
 
@@ -256,7 +296,9 @@ fn extract_zip_archive(bytes: &[u8], depth: usize) -> Result<String, Box<dyn Err
         let Some(member_bytes) = read_limited_bytes(&mut entry)? else {
             continue;
         };
-        let Ok(Some(text)) = extract_archive_member_text(&entry_name, &member_bytes, depth) else {
+        let Ok(Some(text)) =
+            extract_archive_member_text(&entry_name, &member_bytes, options, depth)
+        else {
             continue;
         };
         append_archive_section(&mut output, &entry_name, &text);
@@ -265,7 +307,11 @@ fn extract_zip_archive(bytes: &[u8], depth: usize) -> Result<String, Box<dyn Err
     Ok(clean_extracted_text(output))
 }
 
-fn extract_tar_archive<R>(reader: R, depth: usize) -> Result<String, Box<dyn Error>>
+fn extract_tar_archive<R>(
+    reader: R,
+    options: ExtractionOptions,
+    depth: usize,
+) -> Result<String, Box<dyn Error>>
 where
     R: Read,
 {
@@ -281,7 +327,9 @@ where
         let Some(member_bytes) = read_limited_bytes(&mut entry)? else {
             continue;
         };
-        let Ok(Some(text)) = extract_archive_member_text(&entry_name, &member_bytes, depth) else {
+        let Ok(Some(text)) =
+            extract_archive_member_text(&entry_name, &member_bytes, options, depth)
+        else {
             continue;
         };
         append_archive_section(&mut output, &entry_name, &text);
