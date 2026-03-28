@@ -42,6 +42,7 @@ const HELP_BODY: &str = r#"Usage:
 
 Options:
       --files                 List matching file paths only
+      --debug                 Show debug warnings for files that could not be searched
   -F, --fixed-strings         Treat the query as literal ranked terms instead of a regex
   -i, --ignore-case           Force case insensitive matching
   -s, --case-sensitive        Force case sensitive matching
@@ -67,10 +68,11 @@ Options:
   -w, --word-regexp           Match whole words only
   -x, --line-regexp           Match whole lines only
   -l, --files-with-matches    Print only files that contain matches
-  -L, --files-without-match   Print only files that do not contain matches
+      --files-without-match   Print only files that do not contain matches
   -c, --count                 Print match counts per matching file
       --hidden                Include hidden files and directories
       --no-ignore             Disable .gitignore/.ignore filtering
+  -L, --follow                Follow symbolic links
       --follow-links          Follow symbolic links
   -h, --help                  Show this help
   -v, --version               Show version
@@ -120,6 +122,7 @@ struct Cli {
     query: Option<String>,
     roots: Vec<PathBuf>,
     files_mode: bool,
+    debug: bool,
     match_mode: MatchMode,
     case_mode: CaseMode,
     output_mode: SearchOutputMode,
@@ -586,6 +589,7 @@ where
     let mut no_ignore = false;
     let mut follow_links = false;
     let mut files_mode = false;
+    let mut debug = false;
     let mut match_mode = MatchMode::Regex;
     let mut case_mode = CaseMode::Smart;
     let mut output_mode = SearchOutputMode::Standard;
@@ -607,6 +611,7 @@ where
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             "-v" | "--version" => return Ok(ParseOutcome::Version),
             "--files" => files_mode = true,
+            "--debug" => debug = true,
             "-F" | "--fixed-strings" => match_mode = MatchMode::FixedStrings,
             "-i" | "--ignore-case" => case_mode = CaseMode::Insensitive,
             "-s" | "--case-sensitive" => case_mode = CaseMode::Sensitive,
@@ -624,11 +629,11 @@ where
             "-w" | "--word-regexp" => word_regexp = true,
             "-x" | "--line-regexp" => line_regexp = true,
             "-l" | "--files-with-matches" => output_mode = SearchOutputMode::FilesWithMatches,
-            "-L" | "--files-without-match" => output_mode = SearchOutputMode::FilesWithoutMatch,
+            "--files-without-match" => output_mode = SearchOutputMode::FilesWithoutMatch,
             "-c" | "--count" => output_mode = SearchOutputMode::Count,
             "--hidden" => hidden = true,
             "--no-ignore" => no_ignore = true,
-            "--follow-links" => follow_links = true,
+            "-L" | "--follow" | "--follow-links" => follow_links = true,
             "-k" | "--top-k" => {
                 top_k = parse_usize_value(args.next(), &argument)?;
             }
@@ -757,6 +762,7 @@ where
         query,
         roots,
         files_mode,
+        debug,
         match_mode,
         case_mode,
         output_mode,
@@ -784,6 +790,23 @@ where
 
 fn help_text() -> String {
     format!("{VERSION_TEXT}: {HELP_SUMMARY}\n\n{HELP_BODY}")
+}
+
+fn search_warning_message(cli: &Cli, path: &Path, error: &dyn std::fmt::Display) -> Option<String> {
+    if cli.debug {
+        Some(format!(
+            "warning: failed to search {}: {error}",
+            path.display()
+        ))
+    } else {
+        None
+    }
+}
+
+fn maybe_print_search_warning(cli: &Cli, path: &Path, error: &dyn std::fmt::Display) {
+    if let Some(message) = search_warning_message(cli, path, error) {
+        eprintln!("{message}");
+    }
 }
 
 fn parse_usize_value(value: Option<String>, flag: &str) -> Result<usize, String> {
@@ -932,10 +955,7 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
         let remaining_budget = cli.max_candidate_lines.saturating_sub(candidate_lines);
         let mut sink = CollectingSink::new(query.clone(), remaining_budget);
         if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
-            eprintln!(
-                "warning: failed to search {}: {error}",
-                dir_entry.path().display()
-            );
+            maybe_print_search_warning(cli, dir_entry.path(), &error);
             continue;
         }
         if sink.lines.is_empty() {
@@ -1001,10 +1021,7 @@ fn execute_files_with_matches(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>>
         let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), true) {
             Ok(count) => count,
             Err(error) => {
-                eprintln!(
-                    "warning: failed to search {}: {error}",
-                    dir_entry.path().display()
-                );
+                maybe_print_search_warning(cli, dir_entry.path(), &error);
                 continue;
             }
         };
@@ -1037,10 +1054,7 @@ fn execute_files_without_match(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>
         let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), true) {
             Ok(count) => count,
             Err(error) => {
-                eprintln!(
-                    "warning: failed to search {}: {error}",
-                    dir_entry.path().display()
-                );
+                maybe_print_search_warning(cli, dir_entry.path(), &error);
                 continue;
             }
         };
@@ -1073,10 +1087,7 @@ fn execute_count(cli: &Cli) -> Result<Vec<CountEntry>, Box<dyn Error>> {
         let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), false) {
             Ok(count) => count,
             Err(error) => {
-                eprintln!(
-                    "warning: failed to search {}: {error}",
-                    dir_entry.path().display()
-                );
+                maybe_print_search_warning(cli, dir_entry.path(), &error);
                 continue;
             }
         };
@@ -1193,10 +1204,7 @@ fn execute_standard_search(cli: &Cli) -> Result<Vec<MatchEvent>, Box<dyn Error>>
             capture_matches,
         );
         if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
-            eprintln!(
-                "warning: failed to search {}: {error}",
-                dir_entry.path().display()
-            );
+            maybe_print_search_warning(cli, dir_entry.path(), &error);
             continue;
         }
         events.extend(sink.events);
@@ -1228,10 +1236,7 @@ fn execute_json_search(cli: &Cli) -> Result<JsonSearchResult, Box<dyn Error>> {
         totals.searches += 1;
         let mut sink = JsonEventSink::new(dir_entry.path().to_path_buf(), matcher.clone());
         if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
-            eprintln!(
-                "warning: failed to search {}: {error}",
-                dir_entry.path().display()
-            );
+            maybe_print_search_warning(cli, dir_entry.path(), &error);
             continue;
         }
         let result = sink.into_result();
@@ -2132,6 +2137,7 @@ mod tests {
             query: query.map(ToOwned::to_owned),
             roots: vec![root.to_path_buf()],
             files_mode: query.is_none(),
+            debug: false,
             match_mode: MatchMode::Regex,
             case_mode: CaseMode::Smart,
             output_mode: SearchOutputMode::Ranked,
@@ -2277,7 +2283,9 @@ mod tests {
     #[test]
     fn parse_args_accepts_common_rg_flags() {
         let cli = parse_test_cli([
+            "--debug".to_owned(),
             "-i".to_owned(),
+            "-L".to_owned(),
             "-g*.rs".to_owned(),
             "-tpy".to_owned(),
             "-Tjson".to_owned(),
@@ -2295,9 +2303,40 @@ mod tests {
         assert_eq!(cli.type_not_names, vec!["json".to_owned()]);
         assert_eq!(cli.before_context, 1);
         assert_eq!(cli.after_context, 2);
+        assert!(cli.debug);
         assert!(cli.word_regexp);
         assert!(cli.line_regexp);
+        assert!(cli.follow_links);
         assert_eq!(cli.output_mode, SearchOutputMode::Count);
+    }
+
+    #[test]
+    fn parse_args_accepts_long_files_without_match_flag() {
+        let cli = parse_test_cli([
+            "--files-without-match".to_owned(),
+            "python".to_owned(),
+            ".".to_owned(),
+        ]);
+        assert_eq!(cli.output_mode, SearchOutputMode::FilesWithoutMatch);
+    }
+
+    #[test]
+    fn search_warning_message_requires_debug() {
+        let root = create_test_dir("debug-warning");
+        let quiet_cli = test_cli(&root, Some("python"));
+        let debug_cli = Cli {
+            debug: true,
+            ..test_cli(&root, Some("python"))
+        };
+        let error = io::Error::other("pdf extraction panicked: boom");
+
+        assert!(search_warning_message(&quiet_cli, Path::new("broken.pdf"), &error).is_none());
+        assert_eq!(
+            search_warning_message(&debug_cli, Path::new("broken.pdf"), &error),
+            Some("warning: failed to search broken.pdf: pdf extraction panicked: boom".to_owned())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
