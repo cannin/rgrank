@@ -1393,8 +1393,10 @@ fn build_snippets(
 }
 
 fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
-    if let Ok(Some(text)) = extract::extract_searchable_text(path) {
-        return Ok(text.lines().map(ToOwned::to_owned).collect());
+    match extract::extract_searchable_text(path) {
+        Ok(Some(text)) => return Ok(text.lines().map(ToOwned::to_owned).collect()),
+        Ok(None) => {}
+        Err(error) => return Err(io::Error::other(error.to_string())),
     }
     let bytes = fs::read(path)?;
     let content = String::from_utf8_lossy(&bytes);

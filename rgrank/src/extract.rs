@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
 use calamine::{Reader, Xlsx, open_workbook_from_rs};
@@ -54,9 +55,9 @@ fn extract_supported_bytes(
         return Ok(String::new());
     };
 
-    match kind {
+    guard_panic(kind.operation_name(), || match kind {
         SupportedKind::Docx => extract_docx_from_bytes(bytes),
-        SupportedKind::Pdf => Ok(clean_extracted_text(pdf_extract::extract_text_from_mem(bytes)?)),
+        SupportedKind::Pdf => extract_pdf_from_bytes(bytes),
         SupportedKind::Pptx => extract_pptx_from_bytes(bytes),
         SupportedKind::Xlsx => extract_xlsx_from_bytes(bytes),
         SupportedKind::Zip => extract_zip_archive(bytes, depth),
@@ -65,7 +66,7 @@ fn extract_supported_bytes(
             let decoder = MultiGzDecoder::new(Cursor::new(bytes));
             extract_tar_archive(decoder, depth)
         }
-    }
+    })
 }
 
 fn extract_archive_member_text(
@@ -114,6 +115,20 @@ fn detect_supported_kind(name: &str) -> Option<SupportedKind> {
     None
 }
 
+impl SupportedKind {
+    fn operation_name(self) -> &'static str {
+        match self {
+            SupportedKind::Docx => "docx extraction",
+            SupportedKind::Pdf => "pdf extraction",
+            SupportedKind::Pptx => "pptx extraction",
+            SupportedKind::Xlsx => "xlsx extraction",
+            SupportedKind::Zip => "zip extraction",
+            SupportedKind::Tar => "tar extraction",
+            SupportedKind::TarGz => "tar.gz extraction",
+        }
+    }
+}
+
 fn is_office_lockfile_name(name: &str) -> bool {
     name.rsplit(['/', '\\'])
         .next()
@@ -144,6 +159,10 @@ fn extract_pptx_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
         },
         XmlTextMode::Presentation,
     )
+}
+
+fn extract_pdf_from_bytes(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
+    Ok(clean_extracted_text(pdf_extract::extract_text_from_mem(bytes)?))
 }
 
 fn extract_zip_xml_text_from_reader<R, F>(
@@ -292,6 +311,29 @@ fn extract_plain_text(bytes: &[u8]) -> Option<String> {
     }
 }
 
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
+}
+
+fn guard_panic<T, F>(operation: &str, callback: F) -> Result<T, Box<dyn Error>>
+where
+    F: FnOnce() -> Result<T, Box<dyn Error>>,
+{
+    panic::catch_unwind(AssertUnwindSafe(callback))
+        .map_err(|payload| {
+            Box::<dyn Error>::from(io::Error::other(format!(
+                "{operation} panicked: {}",
+                panic_payload_message(payload)
+            )))
+        })?
+}
+
 fn looks_like_text(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return false;
@@ -416,4 +458,18 @@ fn clean_extracted_text(text: String) -> String {
     }
 
     cleaned_lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guard_panic_converts_panics_to_errors() {
+        let error = guard_panic("pdf extraction", || -> Result<(), Box<dyn Error>> {
+            panic!("boom");
+        })
+        .expect_err("panic should become error");
+        assert!(error.to_string().contains("pdf extraction panicked: boom"));
+    }
 }
