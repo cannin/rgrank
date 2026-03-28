@@ -1,3 +1,5 @@
+mod extract;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
@@ -14,6 +16,7 @@ use grep_searcher::{
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
+use std::io::Cursor;
 
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_MAX_CANDIDATE_LINES: usize = 500;
@@ -31,6 +34,7 @@ const PATH_PHRASE_BONUS: f64 = 1.25;
 const MATCH_DENSITY_WEIGHT: f64 = 0.25;
 const SAME_LINE_TERM_BONUS: f64 = 0.45;
 const PROXIMITY_BONUS_WEIGHT: f64 = 1.6;
+const VERSION_TEXT: &str = concat!("rgrank ", env!("CARGO_PKG_VERSION"));
 const HELP_TEXT: &str = r#"rgrank: ripgrep-style search with file-level ranking
 
 Usage:
@@ -70,6 +74,7 @@ Options:
       --no-ignore             Disable .gitignore/.ignore filtering
       --follow-links          Follow symbolic links
   -h, --help                  Show this help
+  -v, --version               Show version
 
 Behavior:
   - Uses ripgrep-style regex matching by default.
@@ -234,6 +239,12 @@ struct JsonTotals {
 struct RunOutcome {
     output: String,
     exit_code: i32,
+}
+
+enum ParseOutcome {
+    Cli(Cli),
+    Help,
+    Version,
 }
 
 #[derive(Debug)]
@@ -491,8 +502,17 @@ fn main() {
 }
 
 fn run() -> Result<RunOutcome, String> {
-    let cli = parse_args()?;
-    execute_cli(&cli)
+    match parse_args()? {
+        ParseOutcome::Cli(cli) => execute_cli(&cli),
+        ParseOutcome::Help => Ok(RunOutcome {
+            output: HELP_TEXT.to_owned(),
+            exit_code: 0,
+        }),
+        ParseOutcome::Version => Ok(RunOutcome {
+            output: VERSION_TEXT.to_owned(),
+            exit_code: 0,
+        }),
+    }
 }
 
 fn execute_cli(cli: &Cli) -> Result<RunOutcome, String> {
@@ -549,11 +569,11 @@ fn execute_cli(cli: &Cli) -> Result<RunOutcome, String> {
     }
 }
 
-fn parse_args() -> Result<Cli, String> {
+fn parse_args() -> Result<ParseOutcome, String> {
     parse_args_from(env::args().skip(1))
 }
 
-fn parse_args_from<I>(args: I) -> Result<Cli, String>
+fn parse_args_from<I>(args: I) -> Result<ParseOutcome, String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -585,7 +605,8 @@ where
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "-h" | "--help" => print_help(),
+            "-h" | "--help" => return Ok(ParseOutcome::Help),
+            "-v" | "--version" => return Ok(ParseOutcome::Version),
             "--files" => files_mode = true,
             "-F" | "--fixed-strings" => match_mode = MatchMode::FixedStrings,
             "-i" | "--ignore-case" => case_mode = CaseMode::Insensitive,
@@ -733,7 +754,7 @@ where
         (Some(query), roots)
     };
 
-    Ok(Cli {
+    Ok(ParseOutcome::Cli(Cli {
         query,
         roots,
         files_mode,
@@ -759,12 +780,7 @@ where
         hidden,
         no_ignore,
         follow_links,
-    })
-}
-
-fn print_help() -> ! {
-    println!("{HELP_TEXT}");
-    std::process::exit(0);
+    }))
 }
 
 fn parse_usize_value(value: Option<String>, flag: &str) -> Result<usize, String> {
@@ -912,7 +928,7 @@ fn execute_search(cli: &Cli) -> Result<SearchReport, Box<dyn Error>> {
         scanned_files += 1;
         let remaining_budget = cli.max_candidate_lines.saturating_sub(candidate_lines);
         let mut sink = CollectingSink::new(query.clone(), remaining_budget);
-        if let Err(error) = searcher.search_path(&matcher, dir_entry.path(), &mut sink) {
+        if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
             eprintln!(
                 "warning: failed to search {}: {error}",
                 dir_entry.path().display()
@@ -979,7 +995,16 @@ fn execute_files_with_matches(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>>
         if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
             continue;
         }
-        let count = search_file_count(&mut searcher, &matcher, dir_entry.path(), true)?;
+        let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), true) {
+            Ok(count) => count,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to search {}: {error}",
+                    dir_entry.path().display()
+                );
+                continue;
+            }
+        };
         if count > 0 {
             files.push(dir_entry.path().to_path_buf());
         }
@@ -1006,7 +1031,16 @@ fn execute_files_without_match(cli: &Cli) -> Result<Vec<PathBuf>, Box<dyn Error>
         if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
             continue;
         }
-        let count = search_file_count(&mut searcher, &matcher, dir_entry.path(), true)?;
+        let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), true) {
+            Ok(count) => count,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to search {}: {error}",
+                    dir_entry.path().display()
+                );
+                continue;
+            }
+        };
         if count == 0 {
             files.push(dir_entry.path().to_path_buf());
         }
@@ -1033,7 +1067,16 @@ fn execute_count(cli: &Cli) -> Result<Vec<CountEntry>, Box<dyn Error>> {
         if !matches!(dir_entry.file_type(), Some(file_type) if file_type.is_file()) {
             continue;
         }
-        let count = search_file_count(&mut searcher, &matcher, dir_entry.path(), false)?;
+        let count = match search_file_count(&mut searcher, &matcher, dir_entry.path(), false) {
+            Ok(count) => count,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to search {}: {error}",
+                    dir_entry.path().display()
+                );
+                continue;
+            }
+        };
         if count > 0 {
             counts.push(CountEntry {
                 path: dir_entry.path().to_path_buf(),
@@ -1101,8 +1144,24 @@ fn search_file_count(
     stop_after_first: bool,
 ) -> Result<usize, Box<dyn Error>> {
     let mut sink = CountingSink::new(stop_after_first);
-    searcher.search_path(matcher, path, &mut sink)?;
+    search_target(searcher, matcher, path, &mut sink)?;
     Ok(sink.match_count)
+}
+
+fn search_target<S>(
+    searcher: &mut Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    path: &Path,
+    sink: &mut S,
+) -> io::Result<()>
+where
+    S: Sink<Error = io::Error>,
+{
+    match extract::extract_searchable_text(path) {
+        Ok(Some(text)) => searcher.search_reader(matcher, Cursor::new(text.into_bytes()), sink),
+        Ok(None) => searcher.search_path(matcher, path, sink),
+        Err(error) => Err(io::Error::other(error.to_string())),
+    }
 }
 
 fn execute_standard_search(cli: &Cli) -> Result<Vec<MatchEvent>, Box<dyn Error>> {
@@ -1130,7 +1189,7 @@ fn execute_standard_search(cli: &Cli) -> Result<Vec<MatchEvent>, Box<dyn Error>>
             matcher.clone(),
             capture_matches,
         );
-        if let Err(error) = searcher.search_path(&matcher, dir_entry.path(), &mut sink) {
+        if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
             eprintln!(
                 "warning: failed to search {}: {error}",
                 dir_entry.path().display()
@@ -1165,7 +1224,7 @@ fn execute_json_search(cli: &Cli) -> Result<JsonSearchResult, Box<dyn Error>> {
         }
         totals.searches += 1;
         let mut sink = JsonEventSink::new(dir_entry.path().to_path_buf(), matcher.clone());
-        if let Err(error) = searcher.search_path(&matcher, dir_entry.path(), &mut sink) {
+        if let Err(error) = search_target(&mut searcher, &matcher, dir_entry.path(), &mut sink) {
             eprintln!(
                 "warning: failed to search {}: {error}",
                 dir_entry.path().display()
@@ -1331,6 +1390,9 @@ fn build_snippets(
 }
 
 fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
+    if let Ok(Some(text)) = extract::extract_searchable_text(path) {
+        return Ok(text.lines().map(ToOwned::to_owned).collect());
+    }
     let bytes = fs::read(path)?;
     let content = String::from_utf8_lossy(&bytes);
     Ok(content.lines().map(ToOwned::to_owned).collect())
@@ -2050,8 +2112,12 @@ fn clone_snippet(snippet: &Snippet) -> Snippet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::Write;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     fn test_cli(root: &Path, query: Option<&str>) -> Cli {
         Cli {
@@ -2080,6 +2146,14 @@ mod tests {
             hidden: false,
             no_ignore: false,
             follow_links: false,
+        }
+    }
+
+    fn parse_test_cli(args: impl IntoIterator<Item = String>) -> Cli {
+        match parse_args_from(args).expect("parse args") {
+            ParseOutcome::Cli(cli) => cli,
+            ParseOutcome::Help => panic!("expected cli parse result, got help"),
+            ParseOutcome::Version => panic!("expected cli parse result, got version"),
         }
     }
 
@@ -2172,8 +2246,7 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_files_mode_without_query() {
-        let cli =
-            parse_args_from(["--files".to_owned(), "./hypotheses".to_owned()]).expect("parse args");
+        let cli = parse_test_cli(["--files".to_owned(), "./hypotheses".to_owned()]);
         assert!(cli.files_mode);
         assert!(cli.query.is_none());
         assert_eq!(cli.roots, vec![PathBuf::from("./hypotheses")]);
@@ -2183,12 +2256,11 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_fixed_strings_mode() {
-        let cli = parse_args_from([
+        let cli = parse_test_cli([
             "-F".to_owned(),
             "cortisol level".to_owned(),
             "./hypotheses".to_owned(),
-        ])
-        .expect("parse args");
+        ]);
         assert!(!cli.files_mode);
         assert_eq!(cli.query.as_deref(), Some("cortisol level"));
         assert_eq!(cli.match_mode, MatchMode::FixedStrings);
@@ -2196,7 +2268,7 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_common_rg_flags() {
-        let cli = parse_args_from([
+        let cli = parse_test_cli([
             "-i".to_owned(),
             "-g*.rs".to_owned(),
             "-tpy".to_owned(),
@@ -2208,8 +2280,7 @@ mod tests {
             "-c".to_owned(),
             "python".to_owned(),
             ".".to_owned(),
-        ])
-        .expect("parse args");
+        ]);
         assert_eq!(cli.case_mode, CaseMode::Insensitive);
         assert_eq!(cli.globs, vec!["*.rs".to_owned()]);
         assert_eq!(cli.type_names, vec!["py".to_owned()]);
@@ -2223,15 +2294,20 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_ranked_all_flag() {
-        let cli = parse_args_from([
+        let cli = parse_test_cli([
             "--ranked".to_owned(),
             "--all".to_owned(),
             "timeout".to_owned(),
             ".".to_owned(),
-        ])
-        .expect("parse args");
+        ]);
         assert_eq!(cli.output_mode, SearchOutputMode::Ranked);
         assert!(cli.show_all);
+    }
+
+    #[test]
+    fn parse_args_accepts_version_flag() {
+        let outcome = parse_args_from(["--version".to_owned()]).expect("parse args");
+        assert!(matches!(outcome, ParseOutcome::Version));
     }
 
     #[test]
@@ -2458,6 +2534,45 @@ mod tests {
     }
 
     #[test]
+    fn extracted_docx_snippets_use_human_readable_text() {
+        let root = create_test_dir("docx-snippet");
+        let file = root.join("sample.docx");
+        create_test_docx(
+            &file,
+            &[
+                "Human readable heading",
+                "cortisol level in serum",
+                "closing notes",
+            ],
+        );
+
+        let cli = Cli {
+            match_mode: MatchMode::FixedStrings,
+            before_context: 1,
+            after_context: 1,
+            context_explicit: true,
+            ..test_cli(&file, Some("cortisol"))
+        };
+        let report = execute_search(&cli).expect("report");
+        assert_eq!(report.results.len(), 1);
+        let snippet_lines: Vec<_> = report.results[0].snippets[0]
+            .lines
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(
+            snippet_lines,
+            vec![
+                "Human readable heading",
+                "cortisol level in serum",
+                "closing notes",
+            ]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn count_output_omits_path_for_single_file() {
         let root = create_test_dir("count-single");
         let file = root.join("sample.txt");
@@ -2583,5 +2698,28 @@ mod tests {
         let root = env::temp_dir().join(format!("rgrank-{label}-{}-{timestamp}", process::id()));
         fs::create_dir_all(&root).expect("create test dir");
         root
+    }
+
+    fn create_test_docx(path: &Path, paragraphs: &[&str]) {
+        let file = File::create(path).expect("create docx");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.start_file("word/document.xml", options)
+            .expect("start document.xml");
+
+        let mut xml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>"#,
+        );
+        for paragraph in paragraphs {
+            xml.push_str("<w:p><w:r><w:t>");
+            xml.push_str(paragraph);
+            xml.push_str("</w:t></w:r></w:p>");
+        }
+        xml.push_str("</w:body></w:document>");
+
+        zip.write_all(xml.as_bytes()).expect("write document.xml");
+        zip.finish().expect("finish docx");
     }
 }
