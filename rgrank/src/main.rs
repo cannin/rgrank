@@ -41,7 +41,7 @@ const HELP_BODY: &str = r#"Usage:
   rgrank --files [options] [path ...]
 
 Options:
-      --files                 List matching file paths only
+      --files                 List searchable file paths without searching contents
       --debug                 Show debug warnings for files that could not be searched
   -F, --fixed-strings         Treat the query as literal ranked terms instead of a regex
   -i, --ignore-case           Force case insensitive matching
@@ -82,6 +82,9 @@ Behavior:
   - Use -F/--fixed-strings for literal term matching.
   - Standard rg-style output is the default.
   - Use --ranked for ranked file/snippet output.
+  - Use -g '*.ext' to include an extension and -g '!*.ext' to exclude one.
+  - Use -t TYPE to include a built-in file type and -T TYPE to exclude one.
+  - Use --debug to show skipped-file and extractor warnings.
   - Standard output defaults to zero context; ranked snippets default to 2 lines before/after.
   - Respects .gitignore/.ignore by default.
   - Ranks files with BM25-like scoring, term coverage, filename boosts, and phrase/proximity bonuses.

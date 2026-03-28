@@ -99,16 +99,20 @@ Ranked examples:
 ./rgrank/target/release/rgrank -w 'python' .
 ./rgrank/target/release/rgrank -x '^python$' .
 ./rgrank/target/release/rgrank -l 'timeout|config' .
-./rgrank/target/release/rgrank -L 'timeout|config' .
+./rgrank/target/release/rgrank --files-without-match 'timeout|config' .
 ./rgrank/target/release/rgrank -c 'timeout|config' .
+./rgrank/target/release/rgrank -L 'timeout|config' ./linked-tree
 ./rgrank/target/release/rgrank --hidden --no-ignore "timeout config" .
 ./rgrank/target/release/rgrank 'whisper|process_all_mp4s|python' .
 ./rgrank/target/release/rgrank -F "cortisol level" .
 ./rgrank/target/release/rgrank --files ./hypotheses
+./rgrank/target/release/rgrank --debug 'cortisol' ./examples
 ./rgrank/target/release/rgrank --version
 ```
 
 `--files` switches `rgrank` into path-listing mode similar to `rg --files`. In that mode it does not require a query and prints one file path per line while still respecting `.gitignore`, hidden-file, and symlink settings.
+
+Use `--debug` to show skipped-file and extractor warnings. Without `--debug`, `rgrank` suppresses those per-file warnings and keeps normal output quiet.
 
 Common `rg`-style flags supported now:
 
@@ -118,9 +122,30 @@ Common `rg`-style flags supported now:
 - `-w` and `-x` for word and whole-line matching
 - `-A`, `-B`, and `-C` for rg-style context output
 - `-n`, `--column`, `--heading`, `--no-heading`, `--json`, and `--color`
-- `-l`, `-L`, and `-c` for file-list and count output modes
+- `-l`, `--files-without-match`, and `-c` for file-list and count output modes
+- `-L`, `--follow`, and `--follow-links` for symlink traversal
+- `--debug` for skipped-file and extractor diagnostics
 - `-v`, `--version` for compile-time version output
-- `--follow-links` for symlink traversal
+
+## File filtering
+
+Use `-g` when you want exact extension or path globs:
+
+- include one extension: `-g '*.pdf'`
+- include several extensions: `-g '*.pdf' -g '*.docx'`
+- exclude one extension: `-g '!*.pdf'`
+- exclude several extensions: `-g '!*.pdf' -g '!*.docx'`
+
+Use `-t` and `-T` when you want ripgrep's built-in file type names instead of raw extensions:
+
+- `-tpy` searches only Python files
+- `-Tjson` excludes JSON files
+- `-tpy -Tjson` means include Python files, while excluding JSON if it would otherwise be considered
+
+Rule of thumb:
+
+- use `-g` for literal extension or path patterns
+- use `-t` / `-T` for built-in rg file type categories
 
 # Extracted formats
 
